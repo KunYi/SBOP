@@ -142,13 +142,13 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 | Subsystem | Range | Count |
 | --- | --- | --- |
-| Boot (CRYPTO + PARSE + STATE + VERSION) | ERR-BOOT-xxx-001..099 | 17 |
+| Boot (CRYPTO + PARSE + STATE + VERSION) | ERR-BOOT-xxx-001..099 | 25 |
 | Crypto (SIG + HASH + KDF + RNG) | ERR-CRYPTO-xxx-001..099 | 10 |
 | OTA (AUTH + DOWNLOAD + INSTALL + ACTIVATE + ROLL) | ERR-OTA-xxx-001..099 | 12 |
 | Identity (PROV + AUTH + IDENT + KEY + ATST + CLONE) | ERR-ID-xxx-001..099 | 14 |
 | Storage | ERR-STOR-xxx-001..099 | 4 |
-| Hardware | ERR-HW-xxx-001..099 | 5 |
-| **Total** | | **62** |
+| Hardware | ERR-HW-xxx-001..099 | 7 |
+| **Total** | | **72** |
 
 → Full catalog: `../02_System_Design/Error_Code_Catalog.md`
 

@@ -55,7 +55,9 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-CRYPTO-002 | FATAL | Hash mismatch | Computed SHA-256 of payload does not match header.hash | FAILSAFE | OTA recovery via backend |
 | ERR-BOOT-CRYPTO-003 | FATAL | Unsupported signature algorithm | signature_type in signature block is unknown or unsupported | FAILSAFE | Firmware re-sign with supported algorithm |
 | ERR-BOOT-CRYPTO-004 | FATAL | Key verification failed | Key slot revoked (SR1 revocation bitmap), public key fingerprint mismatch against SR1 OTP, or (legacy) verification key reference resolved to no key | FAILSAFE | Key rotation via backend (non-revoked slot) or re-provisioning |
-| ERR-BOOT-CRYPTO-005 | FATAL | Crypto engine initialization failed | Hardware crypto accelerator not responding | FAILSAFE | Hardware replacement |
+| ERR-BOOT-CRYPTO-005 | FATAL | HW/SW hash mismatch | HW SHA-256 result does not match software SHA-256 (possible HW HASH glitch or FIH attack) | FAILSAFE | Reboot; if persistent: hardware fault |
+| ERR-BOOT-CRYPTO-006 | FATAL | Crypto engine initialization failed | Hardware crypto accelerator not responding | FAILSAFE | Hardware replacement |
+| ERR-BOOT-CRYPTO-007 | FATAL | IV reuse detected | Same (KD, IV_dev) pair used twice — possible AES-CTR keystream replay attack | FAILSAFE | Investigate tamper; re-flash with new image |
 
 ### 4.2 Parse Errors
 
@@ -67,6 +69,10 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-PARSE-004 | FATAL | Invalid image size | header.image_size == 0 or exceeds slot capacity | FAILSAFE | Image corruption; re-flash |
 | ERR-BOOT-PARSE-005 | FATAL | Malformed signature block | signature_size invalid or signature data misaligned | FAILSAFE | Re-sign image |
 | ERR-BOOT-PARSE-006 | FATAL | Invalid signature block pointer | Signature block offset points outside image | FAILSAFE | Image corruption |
+| ERR-BOOT-PARSE-007 | FATAL | Reserved fields not zero | header.reserved[] or reserved2[] contains non-zero bytes | FAILSAFE | Re-flash with valid image |
+| ERR-BOOT-PARSE-008 | FATAL | Board ID mismatch | header.board_id does not match device board ID | FAILSAFE | Flash correct SKU firmware |
+| ERR-BOOT-PARSE-009 | FATAL | Encrypted key index mismatch | flags bits 12-15 enc_key_index != header.enc_key_index | FAILSAFE | Image corruption; re-flash |
+| ERR-BOOT-PARSE-010 | FATAL | Header HMAC verification failed | HMAC-SHA-256-128(KD, header[0..56]) != header.header_hmac | FAILSAFE | SPI bus tampering suspected; re-flash |
 
 ### 4.3 State Machine Errors
 
@@ -83,6 +89,9 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-VERSION-001 | FATAL | Rollback detected | header.firmware_version < stored_version_counter | FAILSAFE | Flash newer firmware |
 | ERR-BOOT-VERSION-002 | FATAL | Version counter corrupted | Stored version counter cannot be read or is invalid | FAILSAFE | Re-flash and re-provision |
 | ERR-BOOT-VERSION-003 | ERROR | Zero version | header.firmware_version == 0 (may indicate unsigned image) | FAILSAFE | Sign with proper version |
+| ERR-BOOT-VERSION-004 | FATAL | Version below factory floor | header.firmware_version < min_allowed_version (SR1 OTP) | FAILSAFE | Flash factory or newer firmware |
+| ERR-BOOT-VERSION-005 | FATAL | Version skip detected | firmware_version != stored_version + 1 (skipped versions in OTP counter) | FAILSAFE | Check signing key integrity |
+| ERR-BOOT-VERSION-006 | FATAL | Version exceeds ceiling | firmware_version > max_allowed_version (metadata ceiling) | FAILSAFE | Verify backend authorization; possible signing key compromise |
 
 ---
 
@@ -222,6 +231,8 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-HW-DEBUG-001 | WARNING | Debug access attempt | Debug connection attempted while LOCKED | Log; if repeated: upgrade severity | Investigate |
 | ERR-HW-FUSE-001 | FATAL | Fuse programming failed | Security fuse could not be programmed during provisioning | Abort provisioning; device rejected | Replace device |
 | ERR-HW-RESET-001 | WARNING | Unexpected reset | System reset from non-boot source | Log; if repeated: investigate | Check watchdog, power supply |
+| ERR-HW-NOR-001 | FATAL | NOR not detected / wrong chip | JEDEC manufacturer ID, type, or capacity mismatch at INIT | FAILSAFE | Check SPI bus; replace NOR chip |
+| ERR-HW-NOR-002 | FATAL | NOR BP bits unrecoverable | Block Protect bits could not be set on NOR flash — possible hardware fault or attack | FAILSAFE | Hardware replacement |
 
 ---
 
@@ -252,10 +263,10 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 
 | Subsystem | Error Range | Available Codes | Used Codes |
 | --- | --- | --- | --- |
-| Boot: CRYPTO | ERR-BOOT-CRYPTO-001..099 | 99 | 5 |
-| Boot: PARSE | ERR-BOOT-PARSE-001..099 | 99 | 6 |
+| Boot: CRYPTO | ERR-BOOT-CRYPTO-001..099 | 99 | 6 |
+| Boot: PARSE | ERR-BOOT-PARSE-001..099 | 99 | 10 |
 | Boot: STATE | ERR-BOOT-STATE-001..099 | 99 | 3 |
-| Boot: VERSION | ERR-BOOT-VERSION-001..099 | 99 | 3 |
+| Boot: VERSION | ERR-BOOT-VERSION-001..099 | 99 | 6 |
 | Crypto: SIG | ERR-CRYPTO-SIG-001..099 | 99 | 3 |
 | Crypto: HASH | ERR-CRYPTO-HASH-001..099 | 99 | 2 |
 | Crypto: KDF | ERR-CRYPTO-KDF-001..099 | 99 | 3 |
@@ -272,4 +283,4 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | Identity: ATST | ERR-ID-ATST-001..099 | 99 | 1 |
 | Identity: CLONE | ERR-ID-CLONE-001..099 | 99 | 2 |
 | Storage | ERR-STOR-001..099 | 99 | 4 |
-| Hardware | ERR-HW-001..099 | 99 | 5 |
+| Hardware | ERR-HW-001..099 | 99 | 7 |

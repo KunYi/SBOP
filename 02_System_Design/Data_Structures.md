@@ -28,16 +28,19 @@ This document defines the logical data structures exchanged between SBOP compone
 
 ```rust
 /// Firmware image header. Fixed-size, parsed at boot.
-/// Total size: 64 bytes (excluding reserved extension)
+/// Total size: 80 bytes (header_size field = 80)
 struct ImageHeader {
     magic:            u32,      // 0x53424F50 ("SBOP")
-    header_version:   u16,      // Header format version (1)
-    header_size:      u16,      // Total header size in bytes (≥ 64)
+    header_version:   u16,      // Header format version (2)
+    header_size:      u16,      // Total header size in bytes (= 80)
     image_size:       u32,      // Payload size in bytes
     firmware_version: u32,      // Monotonic version number
     flags:            u32,      // Feature flags (see Section 3.1)
     hash:             [u8; 32], // SHA-256 of firmware payload
-    reserved:         [u8; 12], // Must be zero (future use)
+    enc_key_index:    u8,       // OTA encryption key pair index (0..3, 0xFF = unused)
+    reserved:         [u8; 3],  // Must be zero
+    header_hmac:      [u8; 16], // HMAC-SHA-256-128(KD, header[0..56]) — SPI bus integrity
+    reserved2:        [u8; 8],  // Must be zero (future use)
 }
 ```
 
@@ -50,7 +53,10 @@ struct ImageHeader {
 | 2 | FLAG_DELTA | Image is a delta/patch update |
 | 3-7 | Reserved | Must be zero |
 | 8 | FLAG_PQC_SIGNATURE | Signature uses post-quantum algorithm |
-| 9-31 | Reserved | Must be zero |
+| 9 | FLAG_OTA_PENDING | Image encrypted with OTA session key K_s (first boot after OTA). Bootloader must perform ECDH + decrypt + KD re-encrypt. |
+| 10-11 | Reserved | Must be zero |
+| 12-15 | enc_key_index (in-band) | OTA encryption key pair index. Redundant with header.enc_key_index field — cross-checked at boot. |
+| 16-31 | Reserved | Must be zero |
 
 ### 3.2 Validation Rules
 
@@ -58,11 +64,13 @@ struct ImageHeader {
 | --- | --- |
 | R-IMG-001 | `magic` must == 0x53424F50 |
 | R-IMG-002 | `header_version` must be ≤ MAX_SUPPORTED_HEADER_VERSION |
-| R-IMG-003 | `header_size` must be ≥ 64 |
+| R-IMG-003 | `header_size` must be ≥ 80 |
 | R-IMG-004 | `image_size` must be > 0 and ≤ MAX_IMAGE_SIZE |
 | R-IMG-005 | `firmware_version` must be > 0 (version 0 is invalid) |
 | R-IMG-006 | Reserved bytes must be zero |
 | R-IMG-007 | SHA-256 of payload must match `hash` |
+| R-IMG-008 | `header_hmac` must == HMAC-SHA-256(KD, header[0..56]) truncated to 128 bits — protects against SPI bus tampering of plaintext header fields |
+| R-IMG-009 | If `enc_key_index` in flags bits 12-15 differs from `header.enc_key_index`, reject image (redundant check) |
 
 ---
 
@@ -328,7 +336,7 @@ struct DebugAuthResponse {
 
 | Structure | Size | Notes |
 | --- | --- | --- |
-| ImageHeader | 64 bytes | Fixed |
+| ImageHeader | 80 bytes | Fixed (header_size = 80) |
 | SignatureBlock (Ed25519) | 116 bytes | 1+1+2+4+32+72+4 (algorithm + key_index + sig_length + reserved + public_key + signature + crc32) |
 | ImageInfo | 52 bytes | + variable fields |
 | DeviceID | 24 bytes | Fixed |
@@ -340,4 +348,4 @@ struct DebugAuthResponse {
 | DebugAuthChallenge | 56 bytes | Fixed |
 | DebugAuthResponse | 36 bytes | Fixed |
 
-**Total static overhead per firmware image:** ~180 bytes (ImageHeader + SignatureBlock)
+**Total static overhead per firmware image:** 196 bytes (ImageHeader 80 B + SignatureBlock 116 B)

@@ -288,7 +288,7 @@ Stage 1 — OTA delivery (X25519 ECDH encrypted, FLAG_OTA_PENDING set):
 Stage 2 — First boot after OTA (bootloader Gate 2):
   Bootloader: S = X25519(OTA_private[i], E) → K_s = HKDF(S)
   Decrypts with K_s → AXI SRAM (volatile).
-  Verifies OTA key fingerprint + revocation (SR1 OTP).
+  Verifies OTA key fingerprint + revocation (SR2 OTP).
   Verifies Ed25519 signature + hash in AXI SRAM.
   Re-encrypts with KD (per-device key) → writes back to NOR.
   Clears FLAG_OTA_PENDING.
@@ -314,7 +314,7 @@ Backend (once per firmware version, all devices share same ciphertext):
   iv           = CSPRNG(16 bytes)                             ← Random IV
   encrypted    = AES-256-CTR(K_s, iv, Payload)                ← Encrypt Payload only
 
-  OTA wire package = ImageHeader          (64 B, plaintext)
+  OTA wire package = ImageHeader          (80 B, plaintext)
                    || key_index           (1 B, in header.reserved[0])
                    || E                   (32 B, plaintext — ephemeral public key)
                    || iv                  (16 B, plaintext)
@@ -328,7 +328,7 @@ Backend (once per firmware version, all devices share same ciphertext):
 OTA Library (Zone 2, during download):
   // NO DECRYPTION. NO ECDH. NO PLAINTEXT IN NOR.
   // OTA treats everything as opaque bytes except ImageHeader metadata.
-  download ImageHeader (64 B)          → verify magic + version + board_id
+  download ImageHeader (80 B)          → verify magic + version + board_id
   download E (32 B)                    → store as-is (plaintext ephemeral key)
   download iv (16 B)                   → store as-is
   download encrypted (N B)             → store as-is (CIPHERTEXT to NOR)
@@ -342,11 +342,11 @@ Bootloader (Zone 1, Phase 5 — first boot after OTA):
   enc_key_index = header.reserved[0]
 
   // OTA key fingerprint + revocation check (before ECDH)
-  Verify SHA-256(OTA_public[enc_key_index]) == SR1_OTP.ota_fingerprint[enc_key_index]
-  Check SR1_OTP.ota_revocation >> enc_key_index & 1 == 1    // Key not revoked
+  Verify SHA-256(OTA_public[enc_key_index]) == SR2_OTP.ota_fingerprint[enc_key_index]
+  Check SR2_OTP.ota_revocation >> enc_key_index & 1 == 1    // Key not revoked
 
   // ECDH + decrypt
-  E  = image_data[64..96]                                    // Ephemeral public key (32 B)
+  E  = image_data[80..112]                                   // Ephemeral public key (32 B)
   S  = X25519(OTA_private[enc_key_index], E)                 // ECDH shared secret
   K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC")                     // AES session key
   Payload = AES-256-CTR_decrypt(K_s, iv, encrypted)          // → AXI SRAM (volatile only)
@@ -417,14 +417,14 @@ Bootloader (Zone 1, Phase 5 — all subsequent boots):
 | Extract image from NOR flash | Payload is ALWAYS ciphertext in NOR (AES-256-CTR with KD or K_s). Plaintext exists only in volatile AXI SRAM during the ~300 ms boot window. |
 | Extract OTA_private from device | Enables decryption only. Cannot encrypt valid firmware (requires OTA_public[i] for ECDH + Ed25519 signing key for signature). |
 | Power-off during OTA download | OTA_private is fixed in .rodata — always available. Partial download detected by hash mismatch in Gate 1. |
-| Power-off during first boot (re-encrypt) | OTA_private is fixed — bootloader re-derives K_s and re-attempts. Slot fallback provides recovery if re-encrypt is interrupted. |
+| Power-off during first boot (re-encrypt) | Write-before-erase: KD-encrypted data written to staging area (upper half of slot) before erasing original. If power fails, bootloader recovers from staging area on next boot. No data loss window. |
 | OTA key compromise | 4-key rotation with OTP revocation. If OTA_private[i] is extracted, backend switches to OTA_public[j] and revokes key[i] via OTP bitmap clear. Blast radius limited to one firmware version. |
 
 ---
 
 ### 3.5 Decision: AXI SRAM Execution (512 KB Application Limit)
 
-**Decision:** The bootloader copies the verified firmware image from external NOR flash into the AXI SRAM (512 KB) and executes it from there. The 1 MB slot size in NOR flash accommodates the image plus header (64 B) and signature block (100 B), with headroom for future growth.
+**Decision:** The bootloader copies the verified firmware image from external NOR flash into the AXI SRAM (512 KB) and executes it from there. The 1 MB slot size in NOR flash accommodates the image plus header (80 B) and signature block (116 B), with headroom for future growth.
 
 **Rationale:**
 
@@ -598,6 +598,100 @@ FIH_FAILURE = 0xC3C3C3C3   (binary: 1100_0011_...)
 Hamming distance: 16 bits between the two values.
 Probability a random glitch flips FIH_FAILURE into FIH_SUCCESS: ~2^-16
 ```
+
+**DTCM FIH State Isolation with Guard Regions:**
+
+FIH state variables are a high-value target for localized EM/laser attacks. A single flipped bit in the accumulator can turn failure into success. To harden against this, FIH state is placed in a dedicated DTCM region with guard words and complementary storage.
+
+```
+// DTCM FIH guard region (placed in dedicated linker section .fih_state)
+#define FIH_GUARD_MAGIC   0xF1F1F1F1   // Guard word sentinel
+
+typedef struct {
+    volatile uint32_t guard_pre;        // MUST be FIH_GUARD_MAGIC
+    volatile fih_int   fih_rc;          // Primary accumulator
+    volatile fih_int   fih_rc_shadow;   // Complementary shadow (~primary)
+    volatile uint32_t guard_mid;        // MUST be FIH_GUARD_MAGIC
+    volatile uint32_t redundancy_ok;    // 1 if redundant checks passed
+    volatile uint32_t redundancy_shadow;// Complementary shadow
+    volatile uint32_t guard_post;       // MUST be FIH_GUARD_MAGIC
+} fih_state_t;
+
+// Linker: place in dedicated 32-byte DTCM region at 0x2000_FF00
+// Surrounding 32 bytes on each side are reserved as guard gap (never touched)
+__attribute__((section(".fih_state"))) volatile fih_state_t fih_state;
+```
+
+**Guard verification macro:**
+
+```
+#define FIH_GUARD_CHECK()  do { \
+    if (fih_state.guard_pre  != FIH_GUARD_MAGIC || \
+        fih_state.guard_mid  != FIH_GUARD_MAGIC || \
+        fih_state.guard_post != FIH_GUARD_MAGIC) { \
+        /* Guard word corrupted — possible localized EM/laser attack */ \
+        handle_fault_injection_detected(); \
+    } \
+    /* Verify complementary shadow consistency */ \
+    if ((fih_state.fih_rc ^ fih_state.fih_rc_shadow) != 0xFFFFFFFF) { \
+        handle_fault_injection_detected(); \
+    } \
+    if ((fih_state.redundancy_ok ^ fih_state.redundancy_shadow) != 0xFFFFFFFF) { \
+        handle_fault_injection_detected(); \
+    } \
+} while(0)
+```
+
+**Integration into critical verification path:**
+
+```
+function sbop_verify_image(image_data, header, sig_block) -> Result:
+    FIH_GUARD_CHECK();  // Verify guard integrity before starting
+
+    fih_state.fih_rc = FIH_SUCCESS;
+    fih_state.fih_rc_shadow = ~FIH_SUCCESS;  // Complementary
+
+    // 1. Magic check (FIH-protected)
+    FIH_GUARD_CHECK();  // Guard check at every decision point
+    if header.magic != 0x53424F50:
+        fih_state.fih_rc = fih_dec(fih_state.fih_rc);
+        fih_state.fih_rc_shadow = ~fih_state.fih_rc;
+
+    // ... (remaining checks follow same pattern) ...
+
+    // 9. Final FIH return
+    FIH_GUARD_CHECK();
+    if fih_ret(fih_state.fih_rc) != true:
+        return FAILSAFE;
+
+    return OK;
+```
+
+**DTCM memory layout with FIH isolation:**
+
+```
+0x2000_0000  DTCM start
+0x2000_0000  Bootloader .data / .bss              ~12 KB
+0x2000_3000  Stack (4 KB)
+0x2000_4000  SPI buffer (4 KB)
+0x2000_5000  General workspace
+...
+0x2000_FEE0  Guard gap (32 B, never touched)       ← Detects overshoot attacks
+0x2000_FF00  .fih_state (32 B, isolated region)    ← FIH guard words + state
+0x2000_FF20  Guard gap (32 B, never touched)       ← Detects overshoot attacks
+0x2000_FF40  Reserved
+0x2001_0000  DTCM end (128 KB boundary)
+```
+
+**Attack coverage:**
+
+| Attack | Defense |
+|--------|---------|
+| EM pulse targeting FIH accumulator | Complementary shadow — single pulse can't flip both `fih_rc` and `fih_rc_shadow` to produce valid (FIH_SUCCESS, ~FIH_SUCCESS) pair |
+| Laser fault on DTCM bit | Guard words at 3 positions (pre, mid, post) detect localized bit flips |
+| Overshoot EM attack | 32-byte guard gaps with known 0x00 pattern — any non-zero byte indicates attack |
+| Register swap glitch | `fih_state` is `volatile` — compiler cannot optimize away re-reads |
+| Power glitch during guard check | Guard check macro repeats at every decision point; single missed check doesn't bypass |
 
 ---
 
@@ -1076,10 +1170,10 @@ Y-Modem parameters:
 **Step 1 — Backend builds plaintext firmware image (once per firmware version):**
 
 ```
-ImageHeader (64 B)
+ImageHeader (80 B)
 ├── magic              : u32  = 0x53424F50 ("SBOP")
 ├── header_version      : u16  = 1
-├── header_size         : u16  = 64
+├── header_size         : u16  = 80
 ├── image_size          : u32  = payload length (plaintext)
 ├── firmware_version    : u32  = semantic version (BCD)
 ├── board_id            : u16  = target board SKU
@@ -1224,8 +1318,8 @@ function ota_download_and_install(update_info, target_slot):
     assert(update_info.UpdateManifest.firmware_version > current_version, ERR-OTA-AUTH-003)
 
     // ── Step 4b: Size check (prevents NOR slot overflow) ──
-    // ImageHeader(64) + E(32) + IV(16) + encrypted_payload + InnerSignatureBlock(116) ≤ SLOT_SIZE
-    max_image_size = SLOT_SIZE - 64 - 32 - 16 - 116
+    // ImageHeader(80) + E(32) + IV(16) + encrypted_payload + InnerSignatureBlock(116) ≤ SLOT_SIZE
+    max_image_size = SLOT_SIZE - 80 - 32 - 16 - 116
     assert(update_info.UpdateManifest.image_size <= max_image_size, ERR-OTA-DOWNLOAD-003)
 
     // ── Step 5: Download ENCRYPTED package ──
@@ -1233,8 +1327,8 @@ function ota_download_and_install(update_info, target_slot):
     // OTA reads ImageHeader (plaintext), passes the rest through as opaque bytes
     download_handle = http_download_begin(update_info.download_url)
 
-    // Read ImageHeader (64 B, plaintext)
-    header_bytes = http_read_exact(download_handle, 64)
+    // Read ImageHeader (80 B, plaintext)
+    header_bytes = http_read_exact(download_handle, 80)
     header = parse_header(header_bytes)
     assert(header.magic == 0x53424F50, ERR-BOOT-PARSE-001)
     assert(header.firmware_version == update_info.UpdateManifest.firmware_version,
@@ -1260,13 +1354,13 @@ function ota_download_and_install(update_info, target_slot):
 
     // ── Step 7: Write ENCRYPTED package to NOR ──
     // Plaintext NEVER touches NOR flash
-    storage_write(target_slot.base + 0,   header_bytes)       // 64 B, plaintext header
-    storage_write(target_slot.base + 64,  encrypted_rest)     // E + IV + ciphertext + InnerSigBlock
-    // Total written to NOR: ~64 + 32 + 16 + 512 KB + 116 B ≈ 512.2 KB (mostly ciphertext)
+    storage_write(target_slot.base + 0,   header_bytes)       // 80 B, plaintext header
+    storage_write(target_slot.base + 80,  encrypted_rest)     // E + IV + ciphertext + InnerSigBlock
+    // Total written to NOR: ~80 + 32 + 16 + 512 KB + 116 B ≈ 512.2 KB (mostly ciphertext)
 
     // ── Step 8: Verify NOR write integrity ──
     nor_data = storage_read_slot(target_slot)
-    nor_hash = sha256(nor_data[64..])  // Skip header, hash the encrypted portion
+    nor_hash = sha256(nor_data[80..])  // Skip header, hash the encrypted portion
     assert(constant_time_compare(nor_hash, computed_enc_hash, 32), ERR-OTA-INSTALL-002)
 
     // ── Step 9: Mark slot VERIFIED ──
@@ -1300,10 +1394,17 @@ function sbop_boot():
     // ... Phases 1-4: INIT, SELECT_SLOT, LOAD_IMAGE, PARSE_HEADER ...
 
     // ImageHeader is plaintext in NOR — parse it directly
-    header = parse_header(image_data[0..64])
+    header = parse_header(image_data[0..80])
+
+    // Verify HMAC over header fields (SPI bus integrity)
+    let hmac_input = image_data[0..56]  // All fields before header_hmac
+    let expected_hmac = hmac_sha256(kd, hmac_input)[0..16]  // Truncated to 128 bits
+    assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-PARSE-010)
+    // FIH: redundant HMAC verify
+    assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-STATE-003)
 
     // encrypted_rest = E (32 B) || IV (16 B) || AES-CTR(Payload) || InnerSignatureBlock (116 B)
-    encrypted_rest = image_data[64..]
+    encrypted_rest = image_data[80..]
     E  = encrypted_rest[0..32]       // Ephemeral public key (32 B)
     iv = encrypted_rest[32..48]       // IV (16 B)
     ciphertext_with_sig = encrypted_rest[48..]  // AES-CTR(Payload) || InnerSigBlock
@@ -1316,7 +1417,7 @@ function sbop_boot():
         // ── First boot after OTA: X25519 ECDH + AES decrypt ──
         enc_key_index = header.reserved[0]                     // Read from ImageHeader
 
-        // Verify OTA key fingerprint (against SR1 OTP)
+        // Verify OTA key fingerprint (against SR2 OTP)
         OTA_private = OTA_PRIVATE_TABLE[enc_key_index]         // From bootloader .rodata
         OTA_public  = X25519(OTA_private, G)                   // Derive public key
         let expected_fp = nor_spi_read_sr1(OTA_KEY_FINGERPRINT_BASE + enc_key_index * 32, 32)
@@ -1361,7 +1462,7 @@ function sbop_boot():
     assert(constant_time_compare(sig_actual_fp, sig_expected_fp, 32), ERR-BOOT-CRYPTO-004)
 
     // Verify Ed25519 signature (Gate 2) using embedded public key
-    sig_input = concat(image_data[0..64], payload)  // ImageHeader || Payload
+    sig_input = concat(image_data[0..80], payload)  // ImageHeader || Payload
     sig_valid = ed25519_verify(sig_input, inner_sig_block.signature, public_key)
     assert(sig_valid, ERR-BOOT-CRYPTO-001)
 
@@ -1371,32 +1472,65 @@ function sbop_boot():
 
     // ── Phase 6: Verify Integrity ──
     state = VERIFY_INTEGRITY
-    computed_hash = sha256(payload)
+    computed_hash = sha256_hw(payload)              // HW HASH (primary)
+    computed_hash_sw = sha256_sw(payload)           // Software SHA-256 cross-check
+    // Both computation paths MUST agree — detects HW HASH glitch or FIH attack
+    assert(constant_time_compare(computed_hash, computed_hash_sw, 32), ERR-BOOT-CRYPTO-005)
+    assert(constant_time_compare(computed_hash, header.hash, 32), ERR-BOOT-CRYPTO-002)
+    // FIH redundant compare (fault injection defense)
     assert(constant_time_compare(computed_hash, header.hash, 32), ERR-BOOT-CRYPTO-002)
 
     // ── Phase 6b: Re-encrypt with KD (if first boot after OTA) ──
     if header.flags & FLAG_OTA_PENDING:
         // Image currently encrypted with K_s (ECDH-derived, shared across all devices).
         // Re-encrypt with KD (per-device key) for subsequent boots.
+        //
+        // WRITE-BEFORE-ERASE PATTERN:
+        // Never erase the active slot until the re-encrypted data is verified on disk.
+        // The slot is 1 MB but the image is ≤512 KB — use the upper half (≥512 KB) as a
+        // staging area. Staging area is pre-erased (0xFF) since it's never been written.
 
         iv_dev = crypto_random_bytes(16)
-        payload_plaintext = plaintext_with_sig[0..payload_len + 116]  // Payload + InnerSigBlock
-        encrypted_dev = aes_ctr_encrypt(kd, iv_dev, payload_plaintext)
+        payload_with_sig = concat(payload, inner_sig_block)  // Payload + InnerSigBlock
+        encrypted_dev = aes_ctr_encrypt(kd, iv_dev, payload_with_sig)
 
-        // Write back to NOR slot: ImageHeader (unchanged) + IV_dev + encrypted_dev
-        // Note: drops E (32 B) and iv (16 B) — replaced with iv_dev (16 B)
-        nor_erase_slot_sector(boot_slot)
-        nor_write(boot_slot.base, image_data[0..64])     // ImageHeader (unchanged)
-        nor_write(boot_slot.base + 64, iv_dev)            // New IV for KD (16 B)
-        nor_write(boot_slot.base + 80, encrypted_dev)     // Re-encrypted with KD
+        // Build new header: copy original, update flags, update hash for KD-encrypted payload
+        new_header = header
+        new_header.flags &= ~FLAG_OTA_PENDING
+        new_header.hash = sha256(encrypted_dev)  // Hash of KD-encrypted payload
+        new_header.header_hmac = hmac_sha256(kd, serialize(new_header)[0..56])[0..16]
 
-        // Clear FLAG_OTA_PENDING in stored header
-        header.flags &= ~FLAG_OTA_PENDING
-        nor_write(boot_slot.base, serialize(header))
+        // Staging offset: half of slot (512 KB = 0x8_0000)
+        staging_base = boot_slot.base + SLOT_STAGING_OFFSET  // 0x8_0000
 
-        // Verify write integrity
-        re_read = nor_read(boot_slot.base, 64 + 16 + len(encrypted_dev))
-        assert(sha256(re_read[64..]) == sha256(iv_dev || encrypted_dev), ERR-STOR-WRITE-001)
+        // Step 1: Write KD-encrypted data to staging area (pre-erased NOR — no erase needed)
+        nor_write(staging_base + 0,   serialize(new_header))   // 80 B, updated header
+        nor_write(staging_base + 80,  iv_dev)                   // 16 B, new IV
+        nor_write(staging_base + 96,  encrypted_dev)            // KD-encrypted payload + sig
+
+        // Step 2: Verify staging write integrity before erasing original
+        staging_data = nor_read(staging_base, 80 + 16 + len(encrypted_dev))
+        assert(sha256(staging_data[96..]) == new_header.hash, ERR-STOR-WRITE-001)
+
+        // Step 3: Mark metadata — staging is ready
+        metadata_set_re_encrypt_state(RE_STATE_STAGED)
+
+        // Step 4: NOW it's safe to erase the original area (0..staging_offset)
+        nor_erase_sector_range(boot_slot.base, staging_base - 1)
+
+        // Step 5: Copy from staging to slot base (or just leave at staging and update pointer)
+        // For simplicity, copy staging → slot base so bootloader always reads from slot base
+        nor_write(boot_slot.base + 0,   staging_data)  // Entire new image
+
+        // Step 6: Verify final write
+        final_data = nor_read(boot_slot.base, len(staging_data))
+        assert(constant_time_compare(final_data, staging_data, len(staging_data)),
+               ERR-STOR-WRITE-001)
+
+        // Step 7: Commit — clear re-encrypt state
+        metadata_set_re_encrypt_state(RE_STATE_IDLE)
+
+        // Staging area will be erased on next OTA write to this slot (or lazily)
 
     // ... Phases 7-10: CHECK_VERSION, COMMIT_VERSION, MARK_ACTIVE, LOCK_BOOT ...
 
@@ -1418,29 +1552,44 @@ function sbop_boot():
 
 | Check | What it proves | Key used |
 |--------|---------------|----------|
-| OTA key fingerprint verify | SHA-256(OTA_private[i] * G) matches SR1 OTP fingerprint | SHA-256 + X25519 + OTP compare |
+| OTA key fingerprint verify | SHA-256(OTA_private[i] * G) matches SR2 OTP fingerprint | SHA-256 + X25519 + OTP compare |
 | OTA key revocation check | The OTA encryption key slot has not been revoked | SR1 OTA revocation bitmap |
 | Signing key fingerprint verify | The embedded signing public key matches the OTP fingerprint for sig_key_index | SHA-256 + OTP compare |
 | Signing key revocation check | The signing key slot has not been revoked in SR1 | SR1 signing revocation bitmap |
 | Ed25519 verify | Payload was signed by KI_private[sig_key_index] (the real firmware signer) | KI_public[sig_key_index] (embedded in SigBlock) |
 | FIH redundant verify | No glitch on the first verification | KI_public[sig_key_index] (repeated) |
-| SHA-256(payload) == header.hash | Decrypted payload matches the hash in the signed header | (SHA-256) |
+| SHA-256 HW (payload) == header.hash | Decrypted payload matches the hash in the signed header | (SHA-256 HW) |
+| SHA-256 SW cross-check | HW HASH result matches software SHA-256 (detects HW HASH glitch / FIH) | (SHA-256 SW) |
 | Re-encrypt with KD | Image now permanently stored with per-device KD | KD |
 
 **Why re-encrypt with KD:**
 
 ```
 Before re-encrypt (first boot after OTA):
-  NOR: ImageHeader || E || iv || AES-CTR(K_s, iv, Payload) || InnerSigBlock
+  NOR: ImageHeader(80B) || E(32B) || iv(16B) || AES-CTR(K_s, iv, Payload) || InnerSigBlock(116B)
   K_s = HKDF-SHA-256(X25519(OTA_private[i], E), "SBOP-OTA-ENC")
   → OTA_private[i] must be available in Zone 1 (PC-ROP protected)
   → E is plaintext in NOR (ephemeral public key, public info)
+  → Encrypted portion: ~512 KB; free space (upper 512 KB): erased (0xFF)
+
+Write-before-erase (Phase 6b, first boot only):
+  Step 1: Write KD-encrypted data to staging area (slot_base + 0x8_0000):
+          staging: ImageHeader(80B) || IV_dev(16B) || AES-CTR(KD, IV_dev, Payload) || InnerSigBlock(116B)
+  Step 2: Verify staging write integrity
+  Step 3: metadata.re_encrypt_state = STAGED
+  Step 4: Erase original area (0x0_0000..0x7_FFFF)
+  Step 5: Copy staging → slot base
+  Step 6: Verify final write
+  Step 7: metadata.re_encrypt_state = IDLE
+  → If power fails at any step, on next boot the bootloader checks re_encrypt_state
+    and recovers: STAGED → re-copy from staging; IDLE → normal boot
 
 After re-encrypt (all subsequent boots):
-  NOR: ImageHeader || IV_dev || AES-CTR(KD, IV_dev, Payload) || InnerSigBlock
+  NOR: ImageHeader(80B) || IV_dev(16B) || AES-CTR(KD, IV_dev, Payload) || InnerSigBlock(116B)
   → Decrypt with KD directly — per-device unique at-rest encryption
   → KD is always available (permanent device key in secure element)
   → E and iv are dropped; replaced with single IV_dev
+  → Staging area available for next OTA cycle
 
 Benefits:
   - Backend encrypts once per firmware release (X25519 ECDH, not per-device)
@@ -1448,7 +1597,7 @@ Benefits:
   - Simplified backend: no per-device encryption, no key lookup
   - Simplified boot: always use KD for decrypt after re-encrypt (no conditional ECDH)
   - Consistent at-rest format: every slot always encrypted with KD after re-encrypt
-  - Power loss during re-encrypt: OTA_private[i] is fixed in .rodata, always available for retry
+  - Power-loss safe: write-before-erase with staging area — no brick window
 ```
 
 #### 3.10.4 Full Verification Flow
@@ -1495,8 +1644,8 @@ Device (Zone 2: OTA Library)                    Device (Zone 1: Bootloader)
               ╔══ GATE 2 (bootloader, first boot after OTA) ══╗
               ║ 1. Read enc_key_index from ImageHeader        ║
               ║ 2. pub = OTA_private[idx] * G                 ║  ← Derive public key
-              ║ 3. SHA-256(pub) == SR1.ota_fp[idx] (OTP)     ║  ← OTA key auth
-              ║ 4. Check SR1.ota_revocation[idx] == 1         ║  ← Key not revoked
+              ║ 3. SHA-256(pub) == SR2.ota_fp[idx] (OTP)     ║  ← OTA key auth
+              ║ 4. Check SR2.ota_revocation[idx] == 1         ║  ← Key not revoked
               ║ 5. S = X25519(OTA_private[idx], E)            ║  ← ECDH shared secret
               ║ 6. K_s = HKDF(S, "SBOP-OTA-ENC")              ║
               ║ 7. AES-CTR decrypt with K_s → AXI SRAM         ║  ← Plaintext only in RAM
@@ -1574,7 +1723,7 @@ Before (old design):
 
 After (new design):
   OTA downloads → verifies encrypted blob → writes ciphertext to NOR → marks VERIFIED
-  NOR flash: ImageHeader (plaintext, 64 B) + AES-CTR(Payload) + InnerSignatureBlock
+  NOR flash: ImageHeader (plaintext, 80 B) + AES-CTR(Payload) + InnerSignatureBlock
   Window: NONE — plaintext never in NOR
   Boot: decrypts directly to AXI SRAM (volatile) → verifies in place → two-pass IWDG stop → jumps to app in AXI SRAM
   Power loss: AXI SRAM loses content → NOR only has ciphertext
@@ -1599,19 +1748,20 @@ First boot after OTA (K_s-encrypted via X25519 ECDH, FLAG_OTA_PENDING set):
 ┌────────────────────────────────────────────────────────────┐
 │ Offset    Size    Content                          Plaintext? │
 │────────  ──────  ───────────────────────────────  ──────────│
-│ 0x000000  64 B    ImageHeader                     YES       │
+│ 0x000000  80 B    ImageHeader                     YES       │
 │                   flags & FLAG_OTA_PENDING = 1    (metadata) │
-│                   reserved[0] = enc_key_index     (metadata) │
-│ 0x000040  32 B    E (ephemeral public key)        YES       │
+│                   enc_key_index (offset 52)       (metadata) │
+│                   header_hmac (offset 56, 16 B)   (integrity)│
+│ 0x000050  32 B    E (ephemeral public key)        YES       │
 │                   X25519 point, sent from backend (public)   │
-│ 0x000060  16 B    IV_ota (random)                 YES       │
-│ 0x000070  ≤512 KB AES-256-CTR(K_s, IV_ota,        NO        │
+│ 0x000070  16 B    IV_ota (random)                 YES       │
+│ 0x000080  ≤512 KB AES-256-CTR(K_s, IV_ota,        NO        │
 │                   Payload)                        (ciphertext)│
 │         K_s = HKDF-SHA-256(X25519(OTA_private[enc_key_index], E), "SBOP-OTA-ENC") │
-│ 0x080070  116 B   InnerSignatureBlock             YES       │
+│ 0x080080  116 B   InnerSignatureBlock             YES       │
 │                   (outside encryption envelope)    (public   │
 │                                                    signature)│
-│ 0x0800E4  ~512 KB Padding / Reserved                         │
+│ 0x0800F4  ~512 KB Padding / Reserved                         │
 └────────────────────────────────────────────────────────────┘
 
 Bootloader Phase 6b re-encrypts with KD → writes back
@@ -1621,22 +1771,24 @@ All subsequent boots (KD-encrypted, FLAG_OTA_PENDING = 0):
 ┌────────────────────────────────────────────────────────────┐
 │ Offset    Size    Content                          Plaintext? │
 │────────  ──────  ───────────────────────────────  ──────────│
-│ 0x000000  64 B    ImageHeader                     YES       │
+│ 0x000000  80 B    ImageHeader                     YES       │
 │                   flags & FLAG_OTA_PENDING = 0    (metadata) │
-│ 0x000040  16 B    IV_dev (random, new)            YES       │
-│ 0x000050  ≤512 KB AES-256-CTR(KD, IV_dev,         NO        │
+│                   header_hmac (offset 56)         (integrity)│
+│ 0x000050  16 B    IV_dev (random, new)            YES       │
+│ 0x000060  ≤512 KB AES-256-CTR(KD, IV_dev,         NO        │
 │                   Payload)                        (ciphertext)│
-│ 0x080050  116 B   InnerSignatureBlock             YES       │
+│ 0x080060  116 B   InnerSignatureBlock             YES       │
 │                   (outside encryption envelope)    (public   │
 │                                                    signature)│
-│ 0x0800C4  ~512 KB Padding / Reserved                         │
+│ 0x0800D4  ~512 KB Padding / Reserved                         │
 └────────────────────────────────────────────────────────────┘
 
-Plaintext in NOR at rest (first boot): 64 + 32 + 16 + 116 = 228 bytes (metadata + E + IV + signature)
-Plaintext in NOR at rest (subsequent): 64 + 16 + 116 = 196 bytes (metadata + IV + signature)
+Plaintext in NOR at rest (first boot): 80 + 32 + 16 + 116 = 244 bytes (metadata + HMAC + E + IV + signature)
+Plaintext in NOR at rest (subsequent): 80 + 16 + 116 = 212 bytes (metadata + HMAC + IV + signature)
 Payload in NOR at rest: ALWAYS ciphertext (AES-256-CTR with K_s or KD)
 K_s in NOR at rest: NEVER (ephemeral session key, zeroized after decrypt)
 Plaintext Payload exists: only in AXI SRAM during execution (volatile, lost on power-off)
+ImageHeader expanded from 64 B to 80 B (+16 B for HMAC field)
 ```
 
 #### 3.10.8 Key Summary
@@ -1826,7 +1978,8 @@ Copy A: 0x20_0000 (4 KB sector)            Copy B: 0x20_1000 (4 KB sector)
 │ [0]  sequence   : u32      │              │ [0]  sequence   : u32      │
 │ [4]  active_slot: u8       │              │ [4]  active_slot: u8       │
 │ [5]  boot_target: u8       │              │ [5]  boot_target: u8       │
-│ [6]  reserved   : u8[2]    │              │ [6]  reserved   : u8[2]    │
+│ [6]  re_encrypt_state: u8  │              │ [6]  re_encrypt_state: u8  │
+│ [7]  reserved   : u8       │              │ [7]  reserved   : u8       │
 │ [8]  slot_a_info: ImageInfo│              │ [8]  slot_a_info: ImageInfo│
 │ [60] slot_b_info: ImageInfo│              │ [60] slot_b_info: ImageInfo│
 │ ...                         │              │ ...                         │
@@ -1834,6 +1987,41 @@ Copy A: 0x20_0000 (4 KB sector)            Copy B: 0x20_1000 (4 KB sector)
 └────────────────────────────┘              └────────────────────────────┘
   512 bytes total                             512 bytes total
   Rest of 4 KB sector unused                  Rest of 4 KB sector unused
+```
+
+**re_encrypt_state values:**
+
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0x00 | RE_STATE_IDLE | No re-encrypt in progress |
+| 0x01 | RE_STATE_STAGED | KD-encrypted data written to staging area, ready to commit |
+| 0x02 | RE_STATE_COMMITTED | Staging data committed, old area pending erase |
+
+**IV reuse detection field:**
+
+```
+[252] last_iv_hash : u8[32]   // SHA-256(IV_dev || KD[0..16]) of last successful boot
+                                // Checked at boot to detect AES-CTR keystream replay.
+                                // Updated after successful Phase 6 integrity verification.
+```
+
+**Updated metadata layout:**
+
+```
+[0]   sequence         : u32      (4 B)
+[4]   active_slot      : u8       (1 B)
+[5]   boot_target      : u8       (1 B)
+[6]   re_encrypt_state : u8       (1 B)
+[7]   reserved         : u8       (1 B)
+[8]   slot_a_info      : ImageInfo (52 B)
+[60]  slot_b_info      : ImageInfo (52 B)
+[112] boot_attempt_count : u8     (1 B)
+[113] prev_boot_phase  : u8       (1 B)
+[114] max_allowed_version : u32   (4 B)  // Anti-rollback ceiling
+[118] reserved2        : u8[102]  (102 B)
+[220] last_iv_hash     : u8[32]   (32 B) // IV reuse detection
+[252] crc32            : u32      (4 B)
+Total: 256 bytes
 ```
 
 **Write protocol (atomic via sequence numbers):**
@@ -2034,7 +2222,7 @@ Application (Zone 2, early init):
 // Fixed-value fields
 check(header.magic             == 0x53424F50,  ERR-BOOT-PARSE-001);  // "SBOP"
 check(header.header_version    == 1,           ERR-BOOT-PARSE-002);  // Version 1 only
-check(header.header_size        == 64,          ERR-BOOT-PARSE-003);  // Exactly 64 bytes
+check(header.header_size        == 80,          ERR-BOOT-PARSE-003);  // Exactly 80 bytes
 
 // Range-check fields
 check(header.image_size        >= 1024,         ERR-BOOT-PARSE-004);  // Min 1 KB
@@ -2087,22 +2275,45 @@ check(sig_block.crc32 == crc32(&sig_block, 96), ERR-BOOT-CRYPTO-001);
 
 ```
 SR1 layout (first 256 bytes of 256-byte usable window):
+  // ── Version control (20 B) ──
   [0]  version_counter  : u32  (monotonic, OTP — can only increase)
   [4]  version_counter2 : u32  (redundant copy, 3-of-4 majority vote)
   [8]  version_counter3 : u32  (redundant copy)
   [12] version_counter4 : u32  (redundant copy)
   [16] boot_slot_selector: u8  (0=A, 1=B)
-  [17] boot_flags        : u8  (bit 0 = key_revocation_enabled)
+  [17] boot_flags        : u8  (bit 0 = sig_key_revocation_enabled)
   [18] min_allowed_version: u32 (minimum version allowed — factory floor)
-  [22] key_revocation    : u16  (OTP — bit[i]=0 permanently revokes key slot i.
-                                 Writable one-way: 0xFFFF at factory → clear bits to revoke.
-                                 0xFFFF = all keys active. 0x0000 = all keys revoked → legacy mode only.)
+  // ── Signing key revocation (2 B) ──
+  [22] sig_key_revocation : u16 (OTP — bit[i]=0 permanently revokes signing key slot i.
+                                  Writable one-way: 0xFFFF at factory → clear bits to revoke.
+                                  0xFFFF = all signing keys active. 0x0000 = all revoked → legacy mode.)
   [24] reserved          : u8[40]
-  [64] key_fingerprint[0]: u8[32]  // SHA-256 of KI_public[0] (primary)
-  [96] key_fingerprint[1]: u8[32]  // SHA-256 of KI_public[1] (secondary)
-  [128] key_fingerprint[2]: u8[32] // SHA-256 of KI_public[2] (backup)
-  [160] key_fingerprint[3]: u8[32] // SHA-256 of KI_public[3] (backup)
+  // ── Signing key fingerprints (128 B) — Ed25519 KI_public[0..3] ──
+  [64] sig_fingerprint[0]: u8[32]  // SHA-256 of KI_public[0] (primary signing key)
+  [96] sig_fingerprint[1]: u8[32]  // SHA-256 of KI_public[1] (secondary signing key)
+  [128] sig_fingerprint[2]: u8[32] // SHA-256 of KI_public[2] (backup signing key)
+  [160] sig_fingerprint[3]: u8[32] // SHA-256 of KI_public[3] (backup signing key)
   [192..255] reserved    : u8[64]  (for future use; all SR offsets ≤ 0xFF for cross-vendor compat)
+
+SR2 layout (first 256 bytes of 256-byte usable window):
+  // ── OTA encryption key revocation (2 B) ──
+  [0]  ota_key_revocation : u16 (OTP — bit[i]=0 permanently revokes OTA key pair i.
+                                  Writable one-way: 0xFFFF at factory → clear bits to revoke.
+                                  0xFFFF = all OTA keys active.)
+  [2]  reserved           : u8[62]
+  // ── OTA encryption key fingerprints (128 B) — X25519 OTA_public[0..3] ──
+  [64] ota_fingerprint[0] : u8[32] // SHA-256 of OTA_public[0] (primary OTA key)
+  [96] ota_fingerprint[1] : u8[32] // SHA-256 of OTA_public[1] (secondary OTA key)
+  [128] ota_fingerprint[2]: u8[32] // SHA-256 of OTA_public[2] (backup OTA key)
+  [160] ota_fingerprint[3]: u8[32] // SHA-256 of OTA_public[3] (backup OTA key)
+  [192..255] reserved     : u8[64] (for future use)
+
+Rationale for SR1/SR2 split:
+  - SR1: Signing keys + version control — needed by ALL boots (Zone 1 bootloader, every boot)
+  - SR2: OTA encryption keys — needed only on first boot after OTA (ECDH decrypt path)
+  - Separate security registers prevent a single SPI command glitch from
+    affecting both signing and encryption verification paths
+  - Both registers use cross-vendor compatibility pattern (offsets ≤ 0xFF)
 
 Version counter write protocol:
   1. Write new version to counter (increment by exactly 1)
@@ -2147,6 +2358,50 @@ Purpose:
   - Stored in OTP — can never be lowered
 ```
 
+**Layer 2b — Maximum allowed version (ceiling, metadata-backed):**
+
+The version counter in SR1 OTP can only increment by 1 per boot. However, an attacker who compromises the signing key can still burn through the counter one version at a time. A ceiling prevents this by capping the maximum version the bootloader will accept. The ceiling is stored in the metadata journal (not OTP) because it must be field-updatable — the backend increments it as part of authorized OTA updates.
+
+```
+Metadata field: max_allowed_version : u32
+
+At factory provisioning:
+  metadata.max_allowed_version = factory_firmware_version
+
+During authorized OTA (backend pushes new ceiling):
+  // BackendUpdateResponse includes new_max_allowed_version
+  // Signed by BACKEND_AUTH key, verified in Gate 1
+  if update_info.new_max_allowed_version > metadata.max_allowed_version:
+      metadata.max_allowed_version = update_info.new_max_allowed_version
+
+At boot:
+  check(header.firmware_version <= metadata.max_allowed_version,
+        ERR-BOOT-VERSION-006)  // Version exceeds ceiling
+
+Purpose:
+  - Prevents attacker with compromised signing key from burning
+    the OTP version counter past the authorized ceiling
+  - Backend controls the version window: [floor, ceiling]
+  - Even if signing key is compromised, attacker cannot install
+    firmware with version > ceiling
+  - Ceiling can be raised by backend (signed command), never lowered
+  - Stored in metadata journal (two-copy atomic) — survives power loss
+```
+
+**Anti-rollback version window:**
+
+```
+  Version number space:
+  
+  0 ─── min_allowed_version ─── stored_version ─── max_allowed_version ─── 0xFFFFFFFF
+         (SR1 OTP floor)         (SR1 OTP counter)   (metadata ceiling)
+         
+         ├──── REJECT ────┼────── ALLOW ──────┼────────── REJECT ──────────┤
+         │  Too old       │  Valid range      │  Exceeds ceiling            │
+         │  (factory      │  (normal          │  (compromised signing       │
+         │   floor)       │   operation)      │   key or attack)            │
+```
+
 **Layer 3 — OTA pre-check (defense in depth):**
 
 ```
@@ -2179,13 +2434,20 @@ Phase 7 (CHECK_VERSION):
   stored_version_v2 = version_counter_read_with_redundancy()
   check(stored_version == stored_version_v2,  ERR-BOOT-STATE-003)
 
-  // Layer 2: Minimum allowed version
+  // Layer 2: Minimum allowed version (factory floor)
   min_version = nor_spi_read_security_register(1, offset=18, len=4)
   check(header.firmware_version >= min_version, ERR-BOOT-VERSION-004)
 
   // Layer 2a: Redundant min version read
   min_version_v2 = nor_spi_read_security_register(1, offset=18, len=4)
   check(min_version == min_version_v2,        ERR-BOOT-STATE-003)
+
+  // Layer 2b: Maximum allowed version (ceiling, metadata-backed)
+  max_version = metadata_read_max_allowed_version()
+  check(header.firmware_version <= max_version, ERR-BOOT-VERSION-006)
+  // Redundant ceiling read
+  max_version_v2 = metadata_read_max_allowed_version()
+  check(max_version == max_version_v2,        ERR-BOOT-STATE-003)
 
   // Core check: firmware >= stored
   check(header.firmware_version >= stored_version, ERR-BOOT-VERSION-001)
@@ -2471,6 +2733,19 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
 
     // ── Phase 3: Load Image ──
     state = LOAD_IMAGE
+
+    // Recovery: check for interrupted re-encrypt (write-before-erase recovery)
+    let re_state = metadata_get_re_encrypt_state()
+    if re_state == RE_STATE_STAGED:
+        // Power was lost between staging write and commit.
+        // Staging area at slot_base + 0x8_0000 has verified KD-encrypted data.
+        // Complete the interrupted re-encrypt.
+        staging_base = slot.base + SLOT_STAGING_OFFSET
+        staging_data = nor_read(staging_base, SLOT_STAGING_SIZE)
+        nor_erase_sector_range(slot.base, staging_base - 1)
+        nor_write(slot.base, staging_data)
+        metadata_set_re_encrypt_state(RE_STATE_IDLE)
+
     let image_data = storage_read_slot(slot)
     if image_data == null: return Err(ERR-STOR-READ-001)
     if image_data.len < MIN_IMAGE_SIZE: return Err(ERR-BOOT-PARSE-001)
@@ -2627,6 +2902,25 @@ function sbop_boot_pass1() -> Never:
     // Normal path — full boot with IWDG
     iwdg_init()
     nor_detect_and_verify()    // JEDEC ID check
+
+    // Verify NOR Block Protect bits BEFORE any metadata read.
+    // BP bits may have been left cleared by a power-loss during OTA,
+    // a failed previous boot, or an attacker probing the SPI bus.
+    // Metadata at 0x20_0000+ must be write-protected before we trust it.
+    let sr1 = nor_spi_read_status_register()
+    if (sr1 & BP2_BIT) == 0:
+        // BP2 not set — metadata area is unprotected.
+        // Re-apply protection immediately. This is a defensive action;
+        // log the event for tamper auditing.
+        tamper_log_write(TAMPER_BP_BITS_CLEARED)
+        nor_spi_write_enable()
+        nor_spi_write_status_register(BP2_BIT | SRP1_ENABLE)
+        // Re-verify
+        let sr1_v2 = nor_spi_read_status_register()
+        if (sr1_v2 & BP2_BIT) == 0:
+            // NOR chip not accepting BP commands — possible hardware fault or attack
+            boot_enter_failsafe(ERR-HW-NOR-002)
+
     check_tamper_state()
 
     // Phases 2-10: Full verification with IWDG refresh at each step
@@ -2704,9 +2998,10 @@ PARSE_HEADER:    IWDG refresh                // Fixed-size parse (< 1 ms)
 VERIFY_SIGNATURE: IWDG refresh every 4 KB    // Streaming decrypt to AXI SRAM
   after decrypt: IWDG refresh                // After Ed25519 verify (~1.2 ms)
 VERIFY_INTEGRITY: IWDG refresh               // After SHA-256 finalize
-  Phase 6b re-encrypt: IWDG refresh every 4 KB NOR erase/write
-    before erase: IWDG refresh               // 4 KB sector erase ~45 ms
-    after write:  IWDG refresh               // Each 4 KB page write ~0.4 ms
+  Phase 6b re-encrypt: IWDG refresh every 4 KB NOR write
+    before staging write: IWDG refresh       // Staging write ~0.4 ms per 4 KB
+    before erase:        IWDG refresh        // 4 KB sector erase ~45 ms
+    after copy:          IWDG refresh        // Each 4 KB page write ~0.4 ms
 CHECK_VERSION:   IWDG refresh                // After SR1 reads
 COMMIT_VERSION:  IWDG refresh                // After SR1 write
 MARK_ACTIVE:     IWDG refresh                // After metadata write
@@ -2724,13 +3019,14 @@ Y-Modem:          IWDG_REFRESH()              // Before each frame + before sect
 |---|---|---|---|
 | INIT | RCC->CSR capture + BKP3R store + Clock init + IWDG start + NOR detect | ~6 ms | Start at 800 ms |
 | SELECT_SLOT | Metadata read | < 1 ms | Yes (after) |
-| LOAD_IMAGE | NOR read (64 B header + 16 B IV) | < 1 ms | Yes (after) |
+| LOAD_IMAGE | NOR read (80 B header + 16 B IV) | < 1 ms | Yes (after) |
 | PARSE_HEADER | Header validation | < 1 ms | Yes (after) |
 | VERIFY_SIGNATURE | AES-CTR decrypt 512 KB to AXI SRAM | ~51 ms | Every 4 KB (~0.4 ms each) |
 | VERIFY_SIGNATURE | Ed25519 verify | ~1.2 ms | Yes (after decrypt, before verify) |
 | VERIFY_INTEGRITY | SHA-256 (HW HASH, streaming) | ~13 ms | Yes (after finalize) |
-| Phase 6b | NOR sector erase (4 KB) | ~45 ms | Yes (before) |
-| Phase 6b | NOR write back 512 KB (KD re-encrypt) | ~51 ms | Every 4 KB (~0.4 ms each) |
+| Phase 6b | NOR write staging area (header + IV + encrypted) | ~0.4 ms | Yes (after) |
+| Phase 6b | NOR sector erase (original area) | ~45 ms | Yes (before) |
+| Phase 6b | NOR copy staging → slot base (512 KB) | ~51 ms | Every 4 KB (~0.4 ms each) |
 | CHECK_VERSION | SR1 reads (4-way redundant) | < 1 ms | Yes (after) |
 | COMMIT_VERSION | SR1 write | ~10 ms | Yes (after) |
 | MARK_ACTIVE | Metadata write | ~10 ms | Yes (after) |
@@ -2922,7 +3218,7 @@ Total: 128 KB
 Byte Address    Size      Region                  Contents
 ─────────────── ───────── ─────────────────────── ──────────────────────────────────
 0x00_0000       1 MB      Slot A                  Firmware image (at-rest encrypted with KD):
-                                                    ImageHeader (64 B, plaintext)
+                                                    ImageHeader (80 B, plaintext)
                                                     IV_dev (16 B, plaintext)
                                                     AES-256-CTR(KD, IV_dev, Payload) ≤ 512 KB
                                                     InnerSignatureBlock (116 B, plaintext)
@@ -2943,8 +3239,8 @@ Byte Address    Size      Region                  Contents
                                                    encrypted delta patches,
                                                    debug auth challenge log
 0x3F_F000       4 KB      Security Register Area  (accessible only via 48H/42H/44H)
-                                                   SR1: version counter (4× 32-bit redundant, 256 B max)
-                                                   SR2: KD commitment (32 bytes, 256 B max)
+                                                   SR1: version counter (4× 32-bit) + signing key fingerprints (4× 32 B) + sig key revocation. 256 B max.
+                                                   SR2: OTA key fingerprints (4× 32 B) + OTA key revocation + KD commitment (32 B). 256 B max.
                                                    SR3: NOR-MCU binding (224-bit composite UID hash, 256 B max)
                                                    Cross-vendor: only first 256 B per SR used
 ─────────────── ───────── ─────────────────────── ──────────────────────────────────
@@ -2954,17 +3250,25 @@ Total: 4 MB
 **Slot content layout (1 MB each, after first boot following OTA):**
 
 ```
+// Slot sizing constants
+SLOT_SIZE            = 1 MB    (0x10_0000)
+SLOT_STAGING_OFFSET  = 512 KB  (0x08_0000)  // Upper half of slot for write-before-erase staging
+SLOT_STAGING_SIZE    = 512 KB               // Maximum staging data (header + IV + payload + sig)
+```
+
+```
 Offset      Size    Field                   Description
 ─────────── ─────── ─────────────────────── ──────────────────────────────────
-0x000000    64 B    ImageHeader             Magic, version, size, board_id, flags, hash
+0x000000    80 B    ImageHeader             Magic, version, size, board_id, flags, hash, enc_key_index, header_hmac
                                            FLAG_OTA_PENDING = 0 (re-encrypted with KD)
-0x000040    16 B    IV_dev                  Random IV for KD encryption
-0x000050    ≤512 KB EncryptedPayload        AES-256-CTR(KD, IV_dev, Payload)
+0x000050    16 B    IV_dev                  Random IV for KD encryption
+0x000060    ≤512 KB EncryptedPayload        AES-256-CTR(KD, IV_dev, Payload)
                                            KD = permanent device key
                                            Payload = plaintext application binary
-0x080050    116 B   InnerSignatureBlock     Ed25519(KI_private) over (ImageHeader||Payload)
+0x080060    116 B   InnerSignatureBlock     Ed25519(KI_private) over (ImageHeader||Payload)
                                            Outside encryption envelope (plaintext)
-0x0800C4    ~512 KB Padding / Reserved      Headroom for larger second-stage images
+0x0800D4    ~512 KB Padding / Reserved      Headroom for larger second-stage images
+                                           **Upper half (≥0x8_0000) reserved as write-before-erase staging area**
 ─────────── ─────── ─────────────────────── ──────────────────────────────────
 Total: 1 MB per slot
 
@@ -2990,16 +3294,18 @@ Offset   Size  Field                       Offset   Size  Field
                (odd = writing, even = committed)
 0x004    1 B   active_slot                 0x204    1 B   active_slot
 0x005    1 B   boot_target                 0x205    1 B   boot_target
-0x006    1 B   boot_attempt_count          0x206    1 B   boot_attempt_count
+0x006    1 B   re_encrypt_state            0x206    1 B   re_encrypt_state
+               (0x00 = idle, 0x01 = staged, 0x02 = committed)
+0x007    1 B   boot_attempt_count          0x207    1 B   boot_attempt_count
                (0 = healthy, N = consecutive EXECUTE boots without health report)
-0x007    1 B   prev_boot_phase             0x207    1 B   prev_boot_phase
+0x008    1 B   prev_boot_phase             0x208    1 B   prev_boot_phase
                (0x00 = did not reach EXECUTE, 0x01 = reached EXECUTE)
-0x008   52 B   slot_a_info (ImageInfo)     0x208   52 B   slot_a_info (ImageInfo)
-0x03C   52 B   slot_b_info (ImageInfo)     0x23C   52 B   slot_b_info (ImageInfo)
-0x070    4 B   boot_count_a                0x270    4 B   boot_count_a
-0x074    4 B   boot_count_b                0x274    4 B   boot_count_b
-0x078    4 B   rollback_count              0x278    4 B   rollback_count
-0x07C  112 B   reserved                    0x27C  112 B   reserved
+0x009   52 B   slot_a_info (ImageInfo)     0x209   52 B   slot_a_info (ImageInfo)
+0x03D   52 B   slot_b_info (ImageInfo)     0x23D   52 B   slot_b_info (ImageInfo)
+0x071    4 B   boot_count_a                0x271    4 B   boot_count_a
+0x075    4 B   boot_count_b                0x275    4 B   boot_count_b
+0x079    4 B   rollback_count              0x279    4 B   rollback_count
+0x07D  111 B   reserved                    0x27D  111 B   reserved
 0x0EC    4 B   crc32                      0x2EC    4 B   crc32
               (over bytes 0x000–0x0EB)               (over bytes 0x200–0x2EB)
 ───────  ────                             ───────  ────
@@ -3085,20 +3391,31 @@ Decryption happens in a single streaming pass during Phase 5 (VERIFY_SIGNATURE).
 ```
 Phase 5 (VERIFY_SIGNATURE) + Phase 6 (VERIFY_INTEGRITY) — combined streaming pass:
 
-  Input:  NOR slot → ImageHeader (64 B) + E (32 B) + IV (16 B) + AES-CTR(Payload) + InnerSigBlock
+  Input:  NOR slot → ImageHeader (80 B) + E (32 B) + IV (16 B) + AES-CTR(Payload) + InnerSigBlock
   Output: AXI SRAM → Payload (plaintext, ready to execute)
 
   // For first boot after OTA (FLAG_OTA_PENDING set):
   1a. enc_key_index = header.reserved[0]
-  1b. pub = X25519(OTA_private[enc_key_index], G); verify SHA-256(pub) against SR1 OTP
-  1c. Check SR1 OTA revocation bitmap for enc_key_index
-  1d. E = nor_read(slot_base + 64, 32)                             // Ephemeral public key
+  1b. pub = X25519(OTA_private[enc_key_index], G); verify SHA-256(pub) against SR2 OTP
+  1c. Check SR2 OTA revocation bitmap for enc_key_index
+  1d. E = nor_read(slot_base + 80, 32)                             // Ephemeral public key
   1e. S = X25519(OTA_private[enc_key_index], E)                     // ECDH shared secret
   1f. K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC", 32)                   // AES-256 session key
   1g. secure_zeroize(S, 32)
 
   // For subsequent boots (FLAG_OTA_PENDING clear):
-  1.  Skip ECDH — use KD directly. IV is at slot_base + 64.
+  1.  Skip ECDH — use KD directly. IV is at slot_base + 80.
+
+  // IV reuse detection (prevents AES-CTR keystream replay):
+  // If same (KD, IV_dev) pair is used twice, XOR of two ciphertexts = XOR of plaintexts.
+  // Detect by storing hash of last-used IV.
+  1h. iv_current = nor_read(slot_base + 80, 16)
+  1i. iv_hash = sha256(iv_current || kd_identifier)       // KD_identifier: first 16 B of KD
+  1j. last_iv_hash = metadata_read_last_iv_hash()
+  1k. assert(constant_time_compare(iv_hash, last_iv_hash, 32) == false,
+             ERR-BOOT-CRYPTO-007)                         // IV reuse detected — possible replay
+  1l. // Update metadata with new IV hash (committed after successful boot)
+      metadata_set_last_iv_hash(iv_hash)
 
   // Common decrypt path:
   2.  Configure HW CRYP: AES-256-CTR, key = K_s or KD, IV from NOR

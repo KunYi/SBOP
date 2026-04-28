@@ -67,6 +67,19 @@ function sbop_boot() -> Never:
     assert(jedec_id[1] == 0x40, ERR-HW-NOR-001)  // SPI NOR flash
     assert(jedec_id[2] == 0x16, ERR-HW-NOR-001)  // 4 MB (32 Mbit)
 
+    // Verify NOR Block Protect bits BEFORE any metadata read.
+    // Metadata at 0x20_0000+ must be write-protected before we trust it.
+    IWDG_REFRESH()
+    let sr1 = nor_spi_read_status_register()
+    if (sr1 & BP2_BIT) == 0:
+        // BP2 not set — metadata area is unprotected. Re-apply immediately.
+        tamper_log_write(TAMPER_BP_BITS_CLEARED)
+        nor_spi_write_enable()
+        nor_spi_write_status_register(BP2_BIT | SRP1_ENABLE)
+        let sr1_v2 = nor_spi_read_status_register()
+        if (sr1_v2 & BP2_BIT) == 0:
+            return Err(ERR-HW-NOR-002)  // NOR not accepting BP commands
+
     // Check tamper state before anything else
     let tamper_state = tamper_detect_get_state()
     if tamper_state == TAMPERED or tamper_state == COMPROMISED:
@@ -172,10 +185,16 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
     if header == null: return Err(ERR-BOOT-PARSE-001)
     if header.magic != 0x53424F50: return Err(ERR-BOOT-PARSE-001)
     if header.header_version > MAX_SUPPORTED_VERSION: return Err(ERR-BOOT-PARSE-002)
-    if header.header_size < 64: return Err(ERR-BOOT-PARSE-003)
+    if header.header_size < 80: return Err(ERR-BOOT-PARSE-003)
     if header.image_size == 0 or header.image_size > MAX_IMAGE_SIZE:
         return Err(ERR-BOOT-PARSE-004)
     if !header.reserved_is_zero(): return Err(ERR-BOOT-PARSE-005)
+
+    // HMAC-SHA-256-128(KD, header[0..56]) — SPI bus integrity (§3.1 R-IMG-008)
+    let header_hmac_input = image_data[0..56]
+    let expected_hmac = crypto_hmac_sha256(KD, header_hmac_input)[0..16]
+    if constant_time_compare(header.header_hmac, expected_hmac, 16) != true:
+        return Err(ERR-BOOT-PARSE-010)
 
     let payload = image_data[header.header_size .. header.header_size + header.image_size]
     let sig_block = parse_signature_block(image_data, header)
@@ -220,9 +239,16 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
 
     // ── Phase 6: Verify Integrity ──
     state = VERIFY_INTEGRITY
-    let computed_hash = crypto_compute_hash(payload)
+    let computed_hash = crypto_compute_hash(payload)         // HW SHA-256 (primary)
+    let computed_hash_sw = crypto_compute_hash_sw(payload)   // Software SHA-256 cross-check
+    // Both paths must agree — detects HW HASH glitch or FIH attack
+    if constant_time_compare(computed_hash, computed_hash_sw, 32) != true:
+        return Err(ERR-BOOT-CRYPTO-005)
     let hash_match = constant_time_compare(computed_hash, header.hash, 32)
     if hash_match != true: return Err(ERR-BOOT-CRYPTO-002)
+    // FIH redundant compare
+    let hash_match_v2 = constant_time_compare(computed_hash, header.hash, 32)
+    if hash_match_v2 != true: return Err(ERR-BOOT-CRYPTO-002)
     IWDG_REFRESH()
 
     // ── Phase 7: Check Version ──
