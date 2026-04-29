@@ -74,6 +74,10 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
     assert(sig_valid == true, ERR-OTA-AUTH-001)
     
     // ── Phase 3: Download Firmware with Progress Journal ──
+    // Downloads the OTA Image Package (encrypted transport format):
+    //   OTAHeader || AAD || AES-256-GCM(ImageHeader || Firmware || SignatureBlock) || GCM_Tag || Ed25519_Sig
+    // The OTA layer stores the package as-is. The bootloader decrypts it on
+    // first boot (FLAG_OTA_PENDING → Phase 4.5 ECDH decrypt + KD_Storage re-encrypt).
     state = OTA_DOWNLOAD
     let inactive_slot = storage_get_inactive_slot()
     assert(inactive_slot != SLOT_INVALID, ERR-OTA-DOWNLOAD-003)
@@ -155,26 +159,28 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
     ota_progress_clear()
     
     // ── Phase 4: Verify Downloaded Image ──
+    // OTA-layer verification of the OTA Image Package.
+    // Full cryptographic verification (ECDH decrypt + Ed25519 + SHA-256)
+    // is deferred to the bootloader's Phase 4.5-6 (defense-in-depth:
+    // the bootloader independently re-verifies everything).
     state = OTA_VERIFY
     
-    // Read back and verify signature
+    // Read back and verify OTA package structure
     let image_data = storage_read_slot(inactive_slot)
-    let header = parse_header(image_data)
-    assert(header.is_ok(), ERR-BOOT-PARSE-001)
+    let ota_header = parse_ota_header(image_data)
+    assert(ota_header.is_ok(), ERR-BOOT-PARSE-011)
+    assert(ota_header.unwrap().magic == 0x534F5441, ERR-BOOT-PARSE-011)
+    assert(ota_header.unwrap().payload_length > 0, ERR-BOOT-PARSE-004)
     
-    let header = header.unwrap()
-    let payload = image_data[header.header_size .. header.header_size + header.image_size]
-    let sig_block = parse_signature_block(image_data, header)
-    assert(sig_block.is_ok(), ERR-BOOT-PARSE-006)
+    // Verify download integrity: SHA-256 over the full OTA package
+    let computed_hash = crypto_compute_hash(image_data)
+    assert(constant_time_compare(computed_hash, info.image_hash, 32), ERR-OTA-DOWNLOAD-002)
     
-    let image_sig_valid = crypto_verify_signature(
-        data = image_data[0 .. header.header_size + header.image_size],
-        sig = sig_block.unwrap().signature_data,
-        sig_len = sig_block.unwrap().signature_size,
-        sig_type = sig_block.unwrap().signature_type,
-        key = key_resolve(IMAGE_VERIFY)
-    )
-    assert(image_sig_valid == true, ERR-BOOT-CRYPTO-001)
+    // Set FLAG_OTA_PENDING so the bootloader knows this is an encrypted OTA image
+    // The bootloader will perform ECDH + GCM decrypt + Ed25519 verify + KD_Storage re-encrypt
+    let header = parse_header(image_data)  // ImageHeader is inside OTAHeader — may not be parseable yet
+    // FLAG_OTA_PENDING is set by the OTA packaging process in the ImageHeader inside the
+    // encrypted payload. The OTA layer just stores the package; the flag is already set.
     
     // ── Phase 5: Store and Mark Pending ──
     state = OTA_INSTALL
@@ -312,8 +318,8 @@ function ota_recover_from_interruption() -> Result<SlotStatus, OTAError>:
 | --- | --- |
 | IDLE → AUTHENTICATE | update_available AND connectivity OK AND battery >= min_pct |
 | AUTHENTICATE → CHECK | auth_token valid AND auth_token not expired |
-| DOWNLOAD → VERIFY | downloaded_bytes == image_size AND SHA-256 matches |
-| VERIFY → INSTALL | Ed25519 signature valid |
+| DOWNLOAD → VERIFY | downloaded_bytes == image_size AND SHA-256 over OTA package matches |
+| VERIFY → INSTALL | OTA package structure valid (magic, payload_length) + SHA-256 matches |
 | INSTALL → ACTIVATE | slot write verified by read-back + hash check |
 | ACTIVATE → IDLE | Boot reports successful execution of new image |
 | ACTIVATE → ROLLBACK | Boot reports failure or fails to report within timeout |

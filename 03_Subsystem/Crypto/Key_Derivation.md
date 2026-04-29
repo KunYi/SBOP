@@ -1,9 +1,9 @@
 # Key Derivation Specification
 
 **Document ID:** SUB-CRYPTO-KDF-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -22,14 +22,23 @@ KR (Root Key) ─── 256-bit symmetric key, stored in HSM
  │    │    256-bit Device Key, unique per device
  │    │    Stored in secure element / TEE
  │    │
- │    ├── KD_Auth = HKDF-Expand(KD, "AUTH", 32)
+ │    ├── KD_Auth = HKDF-Expand(KD, "SBOP-AUTH-v1", 32)
  │    │    │   OTA mutual TLS client certificate key
  │    │    │
- │    ├── KD_Debug = HKDF-Expand(KD, "DEBUG", 32)
+ │    ├── KD_Debug = HKDF-Expand(KD, "SBOP-DEBUG-v1", 32)
  │    │    │   Debug challenge-response authentication key
  │    │    │
- │    └── KD_Storage = HKDF-Expand(KD, "STORAGE", 32)
+ │    └── KD_Storage = HKDF-Expand(KD, "SBOP-STORAGE-v1", 32)
  │         │   Optional flash encryption key
+ │
+ ├── KO (OTA Encryption Key) ─── X25519 key pair
+ │    │                          Generated in HSM, private key never exported
+ │    │                          Same KO_public burned in all device bootloaders
+ │    │
+ │    └── K_s (OTA Session Key) ─── AES-256-GCM key, per-release
+ │         │                        K_s = HKDF-Expand(SharedSecret, "SBOP-OTA-v1" || Version, 32)
+ │         │                        SharedSecret = X25519(Ephemeral_Private, KO_public)
+ │         │                        Ephemeral key pair generated fresh per OTA release
  │
  └── KI (Image Signing Key) ─── Ed25519 key pair
       │                          Generated in HSM, private key never exported
@@ -37,6 +46,28 @@ KR (Root Key) ─── 256-bit symmetric key, stored in HSM
       └── KI_public ─── Embedded in bootloader at build time
                          Published in backend firmware registry
 ```
+
+### 2.1 OTA Session Key (K_s) Derivation
+
+The OTA session key K_s is derived per-release from an X25519 ECDH shared secret:
+
+```
+Ephemeral_Keypair = X25519_KeyGen()       // Fresh per OTA release (Development Team)
+SharedSecret      = X25519(Ephemeral_Private, KO_public)
+K_s               = HKDF-Expand(PRK=SharedSecret, info="SBOP-OTA-v1" || FirmwareVersion, L=32)
+GCM_Nonce         = HKDF-Expand(PRK=SharedSecret, info="SBOP-OTA-NONCE-v1", L=12)
+```
+
+**Purpose:** Provides per-release firmware confidentiality during OTA transmission. The ephemeral key pair ensures forward secrecy — compromise of one release's K_s does not compromise other releases. The ephemeral public key is embedded in the OTA image header so the device can recompute the same shared secret using its KO_public (the static key burned in OTP).
+
+**Sign-then-encrypt ordering:**
+```
+1. Sign plaintext firmware with Ed25519 (KI private key)
+2. Encrypt signed firmware with AES-256-GCM using K_s
+3. Assemble OTA image package (Header || Ephemeral_PubKey || Ciphertext || GCM_Tag || Signature)
+```
+
+The Ed25519 signature covers the plaintext firmware (not the ciphertext), so the signature can be verified before decryption without exposing plaintext to the OTA layer. The bootloader verifies the signature first, then decrypts.
 
 ---
 
@@ -75,9 +106,12 @@ KD_Storage = HKDF-SHA256(KD, info="SBOP-STORAGE-v1", L=32)
 | --- | --- | --- | --- | --- |
 | KR | Root of trust | HSM TRNG (provisioning) | HSM only | Quorum only |
 | KD | Device identity | HKDF(KR, UID) | Secure element / TEE | KeyRef handle |
-| KD_Auth | OTA auth (mTLS) | HKDF(KD, "AUTH") | Secure element | KeyRef handle |
-| KD_Debug | Debug auth | HKDF(KD, "DEBUG") | Secure element | KeyRef handle |
-| KD_Storage | Flash encryption | HKDF(KD, "STORAGE") | Secure element | KeyRef handle (optional) |
+| KD_Auth | OTA auth (mTLS) | HKDF(KD, "SBOP-AUTH-v1") | Secure element | KeyRef handle |
+| KD_Debug | Debug auth | HKDF(KD, "SBOP-DEBUG-v1") | Secure element | KeyRef handle |
+| KD_Storage | Flash encryption (at rest) | HKDF(KD, "SBOP-STORAGE-v1") | Secure element | KeyRef handle |
+| KO (private) | OTA ECDH key agreement | HSM TRNG (ceremony) | HSM only | Quorum + ceremony |
+| KO (public) | OTA ECDH key agreement | KO key pair | Bootloader OTP | Device-side X25519 |
+| K_s | OTA firmware encryption | HKDF(SharedSecret, "SBOP-OTA-v1") | RAM only (ephemeral) | Derived per-release, never stored |
 | KI (private) | Firmware signing | HSM TRNG (ceremony) | HSM only | Quorum + ceremony |
 | KI (public) | Firmware verification | KI key pair | Bootloader, backend | Public read |
 
@@ -106,6 +140,9 @@ KD_Storage = HKDF-SHA256(KD, info="SBOP-STORAGE-v1", L=32)
 | 5 | All derivation MUST be constant-time with respect to input key material |
 | 6 | Backend MUST apply rate limiting to KD derivation requests |
 | 7 | Backend MUST NOT expose raw KD outside HSM boundary |
+| 8 | KO (private) MUST never leave HSM — ECDH operations performed inside HSM |
+| 9 | Ephemeral X25519 key pair MUST be generated fresh per OTA release — never reused |
+| 10 | K_s MUST be zeroized from RAM immediately after use (decrypt + re-encrypt complete) |
 
 ---
 

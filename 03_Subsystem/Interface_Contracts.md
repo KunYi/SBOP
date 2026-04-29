@@ -302,6 +302,92 @@ crypto_derive_key(
         none
 ```
 
+### 4.5 crypto_ecdh
+
+```
+crypto_ecdh(
+    private_key: KeyRef,
+    public_key: &[u8; 32]
+) -> Result<[u8; 32], CryptoError>
+
+    Input:  private_key : KeyRef    |  device X25519 private key (KO_private)
+            public_key : &[u8; 32]  |  ephemeral X25519 public key from OTA header
+    Output: [u8; 32]                |  32-byte shared secret
+    Error:  ERR-CRYPTO-ECDH-001      |  ECDH computation failed
+            ERR-CRYPTO-ECDH-002      |  Invalid public key (all-zero, low-order point)
+
+    Pre:
+        private_key.key_type == OTA_ENCRYPT
+        private_key.key_usage includes KEY_USAGE_DERIVE
+        public_key != [0u8; 32]
+        !is_low_order_point(public_key)   // RFC 7748 §5 check
+
+    Post:
+        output == X25519(private_key, public_key) per RFC 7748
+        output != [0u8; 32]               // all-zero shared secret rejected
+        Deterministic: same inputs → same output
+
+    Timing Contract:
+        Execution time MUST be constant with respect to private_key and public_key
+        Fixed-window Montgomery ladder — no data-dependent branches
+        Max time: 50 ms at 100 MHz (software), < 1 ms with HW accelerator
+
+    Side effects:
+        none
+
+    Security:
+        Output must be passed directly to HKDF — never used as a raw key
+        Shared secret must be zeroized immediately after HKDF derivation
+```
+
+### 4.6 crypto_aead_decrypt
+
+```
+crypto_aead_decrypt(
+    key: &KeyMaterial,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16]
+) -> Result<Vec<u8>, CryptoError>
+
+    Input:  key : &KeyMaterial  |  AES-256-GCM key (K_s or KD_Storage)
+            nonce : &[u8; 12]   |  96-bit GCM nonce (unique per key)
+            aad : &[u8]          |  Additional Authenticated Data
+            ciphertext : &[u8]   |  ciphertext to decrypt
+            tag : &[u8; 16]      |  128-bit GCM authentication tag
+    Output: Vec<u8>              |  decrypted plaintext
+    Error:  ERR-CRYPTO-AEAD-001   |  GCM authentication failed (tag mismatch)
+            ERR-CRYPTO-AEAD-002   |  Invalid key length (must be 32 bytes)
+
+    Pre:
+        key.len == 32
+        nonce.len == 12
+        ciphertext.len > 0
+        (key, nonce) pair has not been used before (per KD_Storage encryption)
+
+    Post:
+        if Ok(plaintext):
+            GCM authentication tag verified — ciphertext not modified
+            plaintext is the authenticated decryption of ciphertext
+            plaintext == AES-256-GCM-Decrypt(key, nonce, aad, ciphertext, tag)
+        if Err:
+            No partial plaintext returned (all-or-nothing per GCM)
+            Tag verification failed — ciphertext tampered or wrong key
+
+    Timing Contract:
+        GHASH must be constant-time with respect to ciphertext and AAD
+        CTR-mode XOR is not secret-dependent
+        No early return on tag mismatch — complete GHASH computation first
+
+    Side effects:
+        Output buffer must be zeroized after use (contains plaintext firmware)
+
+    Security:
+        All-or-nothing: no partial plaintext on tag failure
+        Nonce reuse with same key is FATAL for GCM — IV reuse detection required
+```
+
 ---
 
 ## 5. OTA Subsystem Contracts

@@ -1,9 +1,9 @@
 # SBOP Data Structure Definitions
 
 **Document ID:** SYS-DS-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -37,7 +37,7 @@ struct ImageHeader {
     firmware_version: u32,      // Monotonic version number
     flags:            u32,      // Feature flags (see Section 3.1)
     hash:             [u8; 32], // SHA-256 of firmware payload
-    enc_key_index:    u8,       // OTA encryption key pair index (0..3, 0xFF = unused)
+    enc_key_index:    u8,       // KO key pair index for OTA ECDH (0..3, 0xFF = unused)
     reserved:         [u8; 3],  // Must be zero
     header_hmac:      [u8; 16], // HMAC-SHA-256-128(KD, header[0..56]) — SPI bus integrity
     reserved2:        [u8; 8],  // Must be zero (future use)
@@ -53,7 +53,7 @@ struct ImageHeader {
 | 2 | FLAG_DELTA | Image is a delta/patch update |
 | 3-7 | Reserved | Must be zero |
 | 8 | FLAG_PQC_SIGNATURE | Signature uses post-quantum algorithm |
-| 9 | FLAG_OTA_PENDING | Image encrypted with OTA session key K_s (first boot after OTA). Bootloader must perform ECDH + decrypt + KD re-encrypt. |
+| 9 | FLAG_OTA_PENDING | First boot after OTA download. Payload is AES-256-GCM encrypted with K_s (from X25519 ECDH). Bootloader must: (1) X25519 ECDH with ephemeral pubkey from OTAImagePackage + KO_public → SharedSecret, (2) HKDF → K_s, (3) AES-256-GCM decrypt → plaintext SBOP image, (4) verify Ed25519 signature on plaintext, (5) re-encrypt with KD_Storage for at-rest protection. |
 | 10-11 | Reserved | Must be zero |
 | 12-15 | enc_key_index (in-band) | OTA encryption key pair index. Redundant with header.enc_key_index field — cross-checked at boot. |
 | 16-31 | Reserved | Must be zero |
@@ -74,7 +74,105 @@ struct ImageHeader {
 
 ---
 
-## 4. SignatureBlock
+## 4. OTAImagePackage
+
+The OTA Image Package is the transport format for firmware updates. It wraps the SBOP image (ImageHeader + Firmware + SignatureBlock) with X25519 ECDH + AES-256-GCM encryption for confidentiality during transmission. This is the format produced by the Development Team packaging process and downloaded by devices.
+
+```rust
+/// OTA Image Package — transport format for encrypted firmware updates.
+/// Produced by: Development Team packaging process (sign-then-encrypt).
+/// Consumed by: Device bootloader Phase 5b (decrypt + re-encrypt).
+struct OTAImagePackage {
+    // ── OTA Header (44 bytes fixed) ──
+    magic:            u32,       // 0x534F5441 ("SOTA")
+    version:          u32,       // OTA package format version (1)
+    firmware_version: u32,       // Monotonic firmware version number
+    timestamp:        u64,       // Unix timestamp of packaging
+    ephemeral_pubkey: [u8; 32],  // X25519 ephemeral public key (per-release)
+    payload_length:   u32,       // Length of Encrypted Payload in bytes
+    aad_length:       u16,       // Length of AAD field in bytes (0..512)
+    reserved:         [u8; 6],   // Must be zero
+
+    // ── AAD (variable, aad_length bytes) ──
+    aad:              [u8; aad_length],  // Additional Authenticated Data (GCM)
+
+    // ── Encrypted Payload (variable, payload_length bytes) ──
+    encrypted_payload: [u8; payload_length],
+    // After AES-256-GCM decryption, contains:
+    //   SBOP Image = ImageHeader (80 B) || Firmware Binary || SignatureBlock (116 B)
+
+    // ── GCM Authentication Tag (16 bytes) ──
+    gcm_tag:          [u8; 16],   // AES-256-GCM authentication tag
+
+    // ── Ed25519 Signature (64 bytes) ──
+    signature:        [u8; 64],   // Ed25519 signature over plaintext firmware
+}
+```
+
+### 4.1 OTA Header Fields
+
+| Field | Size | Description |
+| --- | --- | --- |
+| magic | 4 B | `0x534F5441` ("SOTA") — identifies this as an SBOP OTA image package |
+| version | 4 B | OTA package format version (current = 1) |
+| firmware_version | 4 B | Monotonic firmware version — must be > device's current version |
+| timestamp | 8 B | Unix timestamp of packaging — informational, not security-critical |
+| ephemeral_pubkey | 32 B | X25519 ephemeral public key generated per release |
+| payload_length | 4 B | Length of encrypted_payload in bytes |
+| aad_length | 2 B | Length of AAD field in bytes (0..512, 0 = no AAD) |
+| reserved | 6 B | Must be zero |
+
+### 4.2 Encryption Parameters
+
+```
+Ephemeral_Keypair = X25519_KeyGen()          // Fresh per OTA release
+SharedSecret      = X25519(Ephemeral_Private, KO_public)
+K_s               = HKDF-Expand(SharedSecret, "SBOP-OTA-v1" || FirmwareVersion, 32)
+GCM_Nonce         = HKDF-Expand(SharedSecret, "SBOP-OTA-NONCE-v1", 12)
+
+AAD = firmware_version as u32 || device_class || timestamp as u64
+
+EncryptedPayload = AES-256-GCM-Seal(
+    key   = K_s,
+    nonce = GCM_Nonce,
+    aad   = AAD,
+    data  = SBOP_Image  // ImageHeader || Firmware || SignatureBlock
+)
+```
+
+### 4.3 OTA Package Validation Rules
+
+| Rule | Description |
+| --- | --- |
+| R-OTA-001 | `magic` must == 0x534F5441 |
+| R-OTA-002 | `version` must be ≤ MAX_SUPPORTED_OTA_VERSION |
+| R-OTA-003 | `payload_length` must be > 0 and ≤ MAX_IMAGE_SIZE |
+| R-OTA-004 | `aad_length` must be ≤ 512 |
+| R-OTA-005 | `reserved` bytes must be zero |
+| R-OTA-006 | GCM tag must authenticate (ciphertext + AAD integrity) |
+| R-OTA-007 | Ed25519 `signature` must verify against decrypted plaintext firmware |
+| R-OTA-008 | `firmware_version` > device's current active version (anti-rollback at OTA layer) |
+
+### 4.4 Relationship to SBOP ImageHeader
+
+The OTA Image Package is the **transport envelope**. After GCM decrypt, the plaintext is a standard SBOP Image:
+
+```
+OTA Image Package                     SBOP Image (after decrypt)
+┌──────────────────────┐             ┌──────────────────────┐
+│ OTAHeader            │             │ ImageHeader (80 B)   │
+│ AAD                  │             │ Firmware Binary      │
+│ EncryptedPayload ────┼─ decrypt ─→ │ SignatureBlock       │
+│ GCM Tag              │             └──────────────────────┘
+│ Ed25519 Signature ───┼─ verify ──→ (over plaintext above)
+└──────────────────────┘
+```
+
+The SBOP ImageHeader.`FLAG_OTA_PENDING` (bit 9) is set when the image was installed via OTA. The bootloader detects this flag in Phase 5 and performs the ECDH decrypt → KD_Storage re-encrypt sequence before proceeding to signature verification on the recovered plaintext.
+
+---
+
+## 5. SignatureBlock
 
 ```rust
 /// Signature block appended after firmware payload.
@@ -91,13 +189,13 @@ struct SignatureBlock {
 }
 ```
 
-### 4.1 Algorithm Values
+### 5.1 Algorithm Values
 
 | Value | Algorithm | Signature Size |
 | --- | --- | --- |
 | 0x02 | Ed25519 | 64 bytes |
 
-### 4.2 Key Index Values
+### 5.2 Key Index Values
 
 | Value | Meaning |
 | --- | --- |
@@ -107,7 +205,7 @@ struct SignatureBlock {
 | 0x03 | Key slot 3 (backup) |
 | 0xFF | Single-key legacy mode (public key baked into bootloader .rodata) |
 
-### 4.3 Validation Rules
+### 5.3 Validation Rules
 
 | Rule | Description |
 | --- | --- |
@@ -122,7 +220,7 @@ struct SignatureBlock {
 
 ---
 
-## 5. ImageInfo
+## 6. ImageInfo
 
 ```rust
 /// Metadata about a firmware image in a slot.
@@ -143,7 +241,7 @@ struct ImageInfo {
 
 ---
 
-## 6. SlotID and SlotStatus
+## 7. SlotID and SlotStatus
 
 ```rust
 enum SlotID: u8 {
@@ -164,7 +262,7 @@ enum SlotStatus: u8 {
 }
 ```
 
-### 6.1 Slot State Transitions
+### 7.1 Slot State Transitions
 
 ```
 EMPTY ──(write)──> PENDING
@@ -183,7 +281,7 @@ CORRUPT ──(reformat)──> EMPTY
 
 ---
 
-## 7. DeviceID
+## 8. DeviceID
 
 ```rust
 /// Unique device identifier.
@@ -199,7 +297,7 @@ struct DeviceID {
 
 ---
 
-## 8. KeyRef
+## 9. KeyRef
 
 ```rust
 /// Abstract reference to a cryptographic key.
@@ -217,6 +315,7 @@ enum KeyType: u8 {
     IMAGE_VERIFY = 0x02,  // KI — Firmware verification key
     DEBUG_AUTH   = 0x03,  // KD_Debug — Debug authentication key
     BACKEND_AUTH = 0x04,  // Backend verification public key
+    OTA_ENCRYPT  = 0x05,  // KO — OTA encryption key (X25519 ECDH)
 }
 
 // Key usage flags
@@ -227,7 +326,7 @@ const KEY_USAGE_AUTH:   u8 = 0x04;  // Can be used for authentication
 
 ---
 
-## 9. AuthToken
+## 10. AuthToken
 
 ```rust
 /// Authentication token returned by backend after device authentication.
@@ -241,7 +340,7 @@ struct AuthToken {
 
 ---
 
-## 10. UpdateInfo
+## 11. UpdateInfo
 
 ```rust
 /// OTA update descriptor from backend.
@@ -266,7 +365,7 @@ enum UpdatePriority: u8 {
 
 ---
 
-## 11. ProvisioningData
+## 12. ProvisioningData
 
 ```rust
 /// Data exchanged during the provisioning process.
@@ -286,7 +385,7 @@ struct ProvisioningData {
 
 ---
 
-## 12. TelemetryRecord
+## 13. TelemetryRecord
 
 ```rust
 /// Device telemetry report sent to backend.
@@ -306,7 +405,7 @@ struct TelemetryRecord {
 
 ---
 
-## 13. DebugAuthChallenge
+## 14. DebugAuthChallenge
 
 ```rust
 /// Debug authentication challenge-response data.
@@ -326,7 +425,7 @@ struct DebugAuthResponse {
 
 ---
 
-## 14. CriticalMetadata
+## 15. CriticalMetadata
 
 ```rust
 /// Critical metadata journal entry (128 bytes).
@@ -348,7 +447,7 @@ struct CriticalMetadata {
 // Total: 128 bytes
 ```
 
-### 14.1 re_encrypt_state Values
+### 15.1 re_encrypt_state Values
 
 | Value | Name | Meaning |
 |-------|------|---------|
@@ -358,7 +457,7 @@ struct CriticalMetadata {
 
 ---
 
-## 15. FrequentRecord
+## 16. FrequentRecord
 
 ```rust
 /// Per-boot record in the frequent journal ring buffer (64 bytes).
@@ -379,7 +478,7 @@ struct FrequentRecord {
 // Total: 64 bytes. CRC-16 over bytes 0..62 stored at bytes [62..64].
 ```
 
-### 15.1 prev_boot_phase Values
+### 16.1 prev_boot_phase Values
 
 | Value | Name | Meaning |
 |-------|------|---------|
@@ -387,7 +486,7 @@ struct FrequentRecord {
 | 0x01 | PHASE_EXECUTE | Bootloader reached EXECUTE and jumped to application |
 | 0x02 | PHASE_CONFIRMED | Application called boot_set_confirmed() (promoted TESTING→ACTIVE) |
 
-### 15.2 flags Bit Definitions
+### 16.2 flags Bit Definitions
 
 | Bit | Name | Description |
 |-----|------|-------------|
@@ -395,7 +494,7 @@ struct FrequentRecord {
 | 1 | FLAG_WAS_FALLBACK | This boot used the fallback slot (after rollback) |
 | 2-7 | Reserved | Must be zero |
 
-### 15.3 Measured Boot PCR Chain
+### 16.3 Measured Boot PCR Chain
 
 The `pcr_value` field implements a chained measurement log similar to TPM Platform Configuration Registers (PCRs). Each boot extends the chain from the previous boot's measurement, creating a tamper-evident log. A remote attestation verifier can validate the entire boot history by recomputing the chain.
 
@@ -433,7 +532,7 @@ assert(expected == device.current_pcr)
 
 ---
 
-## 16. ProgressRecord
+## 17. ProgressRecord
 
 ```rust
 /// OTA download progress checkpoint (64 bytes).
@@ -456,7 +555,7 @@ struct ProgressRecord {
 // Total: 64 bytes
 ```
 
-### 16.1 Validation Rules
+### 17.1 Validation Rules
 
 | Rule | Description |
 |------|-------------|
@@ -468,7 +567,7 @@ struct ProgressRecord {
 
 ---
 
-## 17. Serialization Rules
+## 18. Serialization Rules
 
 | Rule | Description |
 | --- | --- |
@@ -482,11 +581,14 @@ struct ProgressRecord {
 
 ---
 
-## 18. Size Budgets
+## 19. Size Budgets
 
 | Structure | Size | Notes |
 | --- | --- | --- |
 | ImageHeader | 80 bytes | Fixed (header_size = 80) |
+| OTAImagePackage (header) | 44 bytes | Fixed OTA header (magic..reserved) |
+| OTAImagePackage (GCM tag) | 16 bytes | Per-package |
+| OTAImagePackage (signature) | 64 bytes | Ed25519 over plaintext |
 | SignatureBlock (Ed25519) | 116 bytes | 1+1+2+4+32+72+4 |
 | ImageInfo | 52 bytes | Fixed |
 | CriticalMetadata | 128 bytes | Two copies = 256 B NOR |
@@ -500,8 +602,9 @@ struct ProgressRecord {
 | TelemetryRecord | 62 bytes | Fixed |
 | DebugAuthChallenge | 56 bytes | Fixed |
 | DebugAuthResponse | 36 bytes | Fixed |
-| **Total** | **1,010 bytes** | All fixed structures combined |
+| **Total** | **1,134 bytes** | All fixed structures combined |
 
 **Total static overhead per firmware image:** 196 bytes (ImageHeader 80 B + SignatureBlock 116 B)
+**Total OTA transport overhead:** 124 bytes (OTAHeader 44 B + GCM tag 16 B + Ed25519 sig 64 B)
 
 **Total metadata journal NOR usage:** 16 KB (Critical Copy A 4 KB + Critical Copy B 4 KB + Frequent ring 4 KB + OTA Progress 4 KB)

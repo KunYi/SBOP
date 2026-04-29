@@ -1,9 +1,9 @@
 # SBOP Key Hierarchy
 
 **Document ID:** SYS-KH-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -33,14 +33,22 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
  │     │     │  256-bit, challenge-response protocol
  │     │     │
  │     └──→ KD_Storage = HKDF(KD, "SBOP-STORAGE-v1")
- │           │  Flash encryption key (optional, platform-dependent)
- │           │  256-bit, used only when flash encryption is enabled
+ │           │  Flash encryption key (device-unique secondary encryption)
+ │           │  256-bit, used for OTA re-encrypt and at-rest protection
  │           │
+ ├──→ KO (OTA Encryption Key) — X25519 key pair
+ │     │  OTA firmware encryption, private key in HSM
+ │     │  Public key burned in bootloader OTP (all devices share same KO_public)
+ │     │  Development Team generates ephemeral X25519 per release for ECDH
+ │     │
+ │     └──→ KO_public → Bootloader → X25519 ECDH for OTA decrypt
+ │
  └──→ KI (Image Signing Key) — Ed25519 key pair
        │  Firmware signing, private key in HSM
        │  Public key embedded in bootloader at build time
        │
        └──→ KI_public → Bootloader → Firmware signature verification
+```
 ```
 
 ---
@@ -53,9 +61,11 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 | KD | Symmetric | 256-bit | HKDF(KR, UID) | Secure element / TEE | Per-device |
 | KD_Auth | Symmetric | 256-bit | HKDF(KD, "SBOP-AUTH-v1") | Secure element / TEE | Per-device |
 | KD_Debug | Symmetric | 256-bit | HKDF(KD, "SBOP-DEBUG-v1") | Secure element / TEE | Per-device |
-| KD_Storage | Symmetric | 256-bit | HKDF(KD, "SBOP-STORAGE-v1") | Secure element / TEE | Per-device (optional) |
+| KD_Storage | Symmetric | 256-bit | HKDF(KD, "SBOP-STORAGE-v1") | Secure element / TEE | Per-device |
+| KO (private) | X25519 | 256-bit | Generated in HSM | HSM | Global — all devices (static) |
+| KO (public) | X25519 | 256-bit | — | Bootloader (Zone 1, OTP) | Global — all devices share same key |
 | KI (private) | Ed25519 | 256-bit | Generated in HSM | HSM | Per-firmware-version or per-release |
-| KI (public) | Ed25519 | 256-bit / 256-bit | — | Bootloader (Zone 1, read-only) | Per-firmware-version |
+| KI (public) | Ed25519 | 256-bit | — | Bootloader (Zone 1, read-only) | Per-firmware-version |
 
 ---
 
@@ -65,7 +75,9 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 |-----------|----------|-----------|---------|
 | Device mTLS authentication | KD_Auth | Device → Backend | OTA session establishment |
 | Debug port unlock | KD_Debug | Debug Host → Device | Challenge-response protocol |
-| Flash encryption (optional) | KD_Storage | Device internal | Transparent flash encryption |
+| Flash encryption (at rest) | KD_Storage | Device internal | After OTA decrypt, before flash write |
+| OTA firmware encryption | KO (private) + ephemeral X25519 | Build pipeline → HSM | Per-release packaging |
+| OTA firmware decryption | KO (public) + ephemeral X25519 | Device Boot | Phase 5b (FLAG_OTA_PENDING) |
 | Firmware signature verification | KI (public) | Device Boot | Every boot |
 | Firmware signing | KI (private) | Build pipeline → HSM | Release signing ceremony |
 | Attestation proof | KD | Device → Backend | Provisioning registration |
@@ -82,6 +94,8 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 | KD_Auth | Same as KD | Zone 1 only, used for TLS handshake |
 | KD_Debug | Same as KD | Zone 1 only, used for debug challenge-response |
 | KD_Storage | Same as KD | Zone 1 only, passed to flash controller |
+| KO (private) | HSM, same protection as KI (private) | Build pipeline (authorized release engineers) |
+| KO (public) | Burned in bootloader OTP, Zone 1 read-only after LOCK_BOOT | Readable by all zones (public key) |
 | KI (private) | HSM, quorum-based signing ceremony | Build pipeline (authorized release engineers) |
 | KI (public) | Embedded in bootloader, Zone 1 read-only after LOCK_BOOT | Readable by all zones (public key) |
 
@@ -94,6 +108,7 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 | KR | Key ceremony (once) | Catastrophic only (all devices decommissioned) | All devices untrusted | HSM decommission |
 | KD | Provisioning (per device) | Device decommission + re-provision | Backend revocation list | Tamper detection → zeroize secure element |
 | KD_Auth/KD_Debug/KD_Storage | Derived from KD at first use | Regenerated when KD rotates | Same as KD | Same as KD |
+| KO | Key ceremony (once) | Catastrophic only (all devices decommissioned) | All devices lose OTA decrypt capability | HSM key deletion; OTP burn-in is permanent |
 | KI | Key ceremony (per release or version) | Per release (backward compatible: old KI_public retained for previous images) | Revoke specific firmware versions | HSM key deletion |
 
 ---
@@ -105,6 +120,8 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 3. HKDF info strings are versioned ("SBOP-AUTH-v1") — enables future algorithm migration
 4. No key below KR can be derived without: KR (in HSM) + UID, OR KD (on-device)
 5. KI is independent of device identity — same KI verifies all devices
+6. KO is independent of device identity — same KO_public on all devices (operational simplicity: single OTA image)
+7. KO_public is NOT used for device authentication — only for ECDH key agreement during OTA decrypt
 
 ---
 

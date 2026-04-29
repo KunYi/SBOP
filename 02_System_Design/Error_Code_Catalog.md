@@ -58,6 +58,8 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-CRYPTO-005 | FATAL | HW/SW hash mismatch | HW SHA-256 result does not match software SHA-256 (possible HW HASH glitch or FIH attack) | FAILSAFE | Reboot; if persistent: hardware fault |
 | ERR-BOOT-CRYPTO-006 | FATAL | Crypto engine initialization failed | Hardware crypto accelerator not responding | FAILSAFE | Hardware replacement |
 | ERR-BOOT-CRYPTO-007 | FATAL | IV reuse detected | Same (KD, IV_dev) pair used twice — possible AES-CTR keystream replay attack | FAILSAFE | Investigate tamper; re-flash with new image |
+| ERR-BOOT-CRYPTO-008 | FATAL | ECDH or GCM operation failed | X25519 ECDH shared secret computation failed (all-zero or low-order), AES-256-GCM authentication tag mismatch (ciphertext tampered or wrong key), or HKDF derivation from shared secret failed | FAILSAFE | Re-download OTA image; check KO key material |
+| ERR-BOOT-CRYPTO-009 | FATAL | KD_Storage re-encrypt failed | AES-256-GCM encrypt with KD_Storage failed during OTA decrypt phase | FAILSAFE | Check storage integrity; re-download OTA image |
 
 ### 4.2 Parse Errors
 
@@ -73,6 +75,7 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-PARSE-008 | FATAL | Board ID mismatch | header.board_id does not match device board ID | FAILSAFE | Flash correct SKU firmware |
 | ERR-BOOT-PARSE-009 | FATAL | Encrypted key index mismatch | flags bits 12-15 enc_key_index != header.enc_key_index | FAILSAFE | Image corruption; re-flash |
 | ERR-BOOT-PARSE-010 | FATAL | Header HMAC verification failed | HMAC-SHA-256-128(KD, header[0..56]) != header.header_hmac | FAILSAFE | SPI bus tampering suspected; re-flash |
+| ERR-BOOT-PARSE-011 | FATAL | Invalid OTA header | OTAImagePackage.magic != 0x534F5441 ("SOTA") or OTA header fields invalid (version, payload_length, reserved) | FAILSAFE | Re-download OTA image |
 
 ### 4.3 State Machine Errors
 
@@ -129,6 +132,20 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | --- | --- | --- | --- | --- | --- |
 | ERR-CRYPTO-RNG-001 | FATAL | TRNG failure | Hardware random number generator failed health tests | FAILSAFE (no crypto possible) | Hardware replacement |
 | ERR-CRYPTO-RNG-002 | WARNING | TRNG health test warning | RNG output failed continuous health test | Retry RNG read | If persistent: upgrade to FATAL |
+
+### 5.5 ECDH Errors
+
+| Error ID | Severity | Description | Detail | Handling | Recovery |
+| --- | --- | --- | --- | --- | --- |
+| ERR-CRYPTO-ECDH-001 | ERROR | ECDH computation failed | X25519 scalar multiplication produced all-zero shared secret or low-order point detected | Return error to caller | Re-download OTA image; check KO key material |
+| ERR-CRYPTO-ECDH-002 | ERROR | Invalid ECDH public key | Public key is all-zero, low-order point, or not on Curve25519 | Return error to caller | Verify OTA image header integrity |
+
+### 5.6 AEAD Errors
+
+| Error ID | Severity | Description | Detail | Handling | Recovery |
+| --- | --- | --- | --- | --- | --- |
+| ERR-CRYPTO-AEAD-001 | ERROR | GCM authentication failed | AES-256-GCM tag verification failed — ciphertext tampered or wrong key | Return error to caller | Re-download OTA image |
+| ERR-CRYPTO-AEAD-002 | ERROR | Invalid AEAD key length | Key length != 32 bytes for AES-256-GCM | Return error to caller | Check key derivation parameters |
 
 ---
 
@@ -281,13 +298,15 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 
 | Subsystem | Error Range | Available Codes | Used Codes |
 | --- | --- | --- | --- |
-| Boot: CRYPTO | ERR-BOOT-CRYPTO-001..099 | 99 | 6 |
-| Boot: PARSE | ERR-BOOT-PARSE-001..099 | 99 | 10 |
-| Boot: STATE | ERR-BOOT-STATE-001..099 | 99 | 3 |
+| Boot: CRYPTO | ERR-BOOT-CRYPTO-001..099 | 99 | 9 |
+| Boot: PARSE | ERR-BOOT-PARSE-001..099 | 99 | 11 |
+| Boot: STATE | ERR-BOOT-STATE-001..099 | 99 | 6 |
 | Boot: VERSION | ERR-BOOT-VERSION-001..099 | 99 | 6 |
 | Crypto: SIG | ERR-CRYPTO-SIG-001..099 | 99 | 3 |
 | Crypto: HASH | ERR-CRYPTO-HASH-001..099 | 99 | 2 |
 | Crypto: KDF | ERR-CRYPTO-KDF-001..099 | 99 | 3 |
+| Crypto: ECDH | ERR-CRYPTO-ECDH-001..099 | 99 | 2 |
+| Crypto: AEAD | ERR-CRYPTO-AEAD-001..099 | 99 | 2 |
 | Crypto: RNG | ERR-CRYPTO-RNG-001..099 | 99 | 2 |
 | OTA: AUTH | ERR-OTA-AUTH-001..099 | 99 | 3 |
 | OTA: DOWNLOAD | ERR-OTA-DOWNLOAD-001..099 | 99 | 3 |

@@ -1,9 +1,9 @@
 # Firmware Image Lifecycle
 
 **Document ID:** SYS-ILC-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -20,10 +20,11 @@ Defines how firmware images are created, transferred, validated, and executed, m
 | 1. Build | Build pipeline | Compile source, link, generate binary | Unsigned firmware binary | Reproducible build verification |
 | 2. Package | Build pipeline | Compute SHA-256 hash, construct ImageHeader | Packaged (unsigned) image | Hash verification |
 | 3. Sign | HSM | Ed25519 sign hash, attach signature | Signed firmware image | Signature self-test |
-| 4. Distribute | Backend | Store in firmware registry, assign version, publish | Published firmware image | Registry integrity check |
-| 5. Download | Device (OTA) | Download via TLS 1.3 mutual auth to buffer | Downloaded image (unverified) | TLS integrity |
-| 6. Verify | Device (Boot/OTA) | Verify signature + hash + version (independent of backend) | Verified image | Full re-verification |
-| 7. Execute | Device (Boot) | Mark slot ACTIVE, lock Zone 1, jump to entry | Running firmware | Boot state machine guards |
+| 4. Encrypt | Build pipeline + HSM | X25519 ECDH + AES-256-GCM encrypt signed image | OTA Image Package (encrypted) | GCM tag verify + decrypt self-test |
+| 5. Distribute | Backend | Store in firmware registry, assign version, publish | Published OTA Image Package | Registry integrity check |
+| 6. Download | Device (OTA) | Download via TLS 1.3 mutual auth to buffer | Downloaded OTA package (unverified) | TLS integrity + GCM auth |
+| 7. Verify | Device (Boot/OTA) | ECDH decrypt → verify Ed25519 signature + SHA-256 hash + version | Verified plaintext firmware | Full re-verification |
+| 8. Execute | Device (Boot) | Re-encrypt with KD_Storage, mark slot ACTIVE, lock Zone 1, jump to entry | Running firmware | Boot state machine guards |
 
 ---
 
@@ -50,14 +51,39 @@ Defines how firmware images are created, transferred, validated, and executed, m
 - Signing ceremony: multi-party authorization, audit logged
 - Post-signing: signature self-test (verify with KI public)
 
-### 3.4 Distribute (Backend)
+### 3.4 Encrypt (Build Pipeline + HSM)
+
+- Input: Signed SBOP image (ImageHeader + Firmware + SignatureBlock)
+- Generate ephemeral X25519 key pair (fresh per OTA release)
+- Compute ECDH shared secret: `SharedSecret = X25519(Ephemeral_Private, KO_public)`
+- Derive session key: `K_s = HKDF-Expand(SharedSecret, "SBOP-OTA-v1" || FirmwareVersion, 32)`
+- Derive GCM nonce: `Nonce = HKDF-Expand(SharedSecret, "SBOP-OTA-NONCE-v1", 12)`
+- AES-256-GCM encrypt the signed SBOP image with K_s, Nonce, and AAD
+- Assemble OTA Image Package: OTAHeader(ephemeral_pubkey) || AAD || EncryptedPayload || GCM_Tag || Ed25519_Signature
+- Post-encryption self-test: decrypt with K_s, verify Ed25519 signature on recovered plaintext
+- Zeroize ephemeral private key, K_s, and SharedSecret after self-test
+- Output: OTA Image Package ready for distribution
+
+**Sign-then-encrypt rationale:** The Ed25519 signature (from stage 3) covers the plaintext firmware. It is stored in the OTA Image Package alongside the ciphertext. The device verifies the signature after GCM decryption. This ordering ensures:
+1. GCM authenticates the ciphertext (symmetric integrity — detects transmission errors)
+2. Ed25519 authenticates the plaintext (asymmetric authenticity — proves Dev Team origin)
+3. Both checks must pass before the firmware is trusted
+
+**Ephemeral key management:** Each OTA release uses a unique ephemeral X25519 key pair. The private key is zeroized immediately after packaging. The public key is embedded in the OTA header for device-side ECDH. This provides forward secrecy per release — compromise of one release's K_s does not compromise other releases.
+
+**AAD binding:** `AAD = firmware_version || device_class || timestamp` — binds the ciphertext to firmware metadata, preventing cross-version or cross-class ciphertext substitution.
+
+→ See `../03_Subsystem/Crypto/Crypto_Algorithms.md` §5-6 for algorithm details.
+→ See `../03_Subsystem/Crypto/Key_Derivation.md` §2.1 for K_s derivation.
+
+### 3.5 Distribute (Backend)
 
 - Signed image uploaded to firmware registry
 - Metadata assigned: version, target device groups, rollout policy
 - Registry maintains integrity (hash chain or signed manifest)
 - CDN distributes to devices on request
 
-### 3.5 Download (Device OTA)
+### 3.6 Download (Device OTA)
 
 - Device authenticates via mTLS (KD_Auth client certificate)
 - Backend authorizes: device in group, version applicable, policy allows
@@ -65,7 +91,7 @@ Defines how firmware images are created, transferred, validated, and executed, m
 - Range requests supported for interruption recovery
 - Download complete: image in buffer, not yet trusted
 
-### 3.6 Verify (Device)
+### 3.7 Verify (Device)
 
 - **Device always re-verifies independently of backend.** Backend compromise cannot affect device.
 - Verify signature (Ed25519) against KI public key in Zone 1
@@ -74,7 +100,7 @@ Defines how firmware images are created, transferred, validated, and executed, m
 - All checks passed → image written to inactive slot
 - Any check failed → image discarded, error reported
 
-### 3.7 Execute (Device Boot)
+### 3.8 Execute (Device Boot)
 
 - Boot selects slot (see `Boot_Flow_Pseudocode.md`)
 - Full verification chain repeated at boot (steps 5-9 of boot flow)
@@ -87,9 +113,9 @@ Defines how firmware images are created, transferred, validated, and executed, m
 ## 4. State Transitions
 
 ```
-UNSIGNED ──→ PACKAGED ──→ SIGNED ──→ DISTRIBUTED ──→ DOWNLOADED ──→ VERIFIED ──→ ACTIVE
-                                                                         │
-                                                                         └──→ REJECTED (verification failure)
+UNSIGNED ──→ PACKAGED ──→ SIGNED ──→ ENCRYPTED ──→ DISTRIBUTED ──→ DOWNLOADED ──→ VERIFIED ──→ ACTIVE
+                                                                                             │
+                                                                                             └──→ REJECTED (verification failure)
 ```
 
 ---
@@ -101,6 +127,7 @@ UNSIGNED ──→ PACKAGED ──→ SIGNED ──→ DISTRIBUTED ──→ DOW
 | Build | Compilation error | Reject — fix source |
 | Package | Hash computation error | Reject — check toolchain |
 | Sign | HSM unavailable | Block release — retry with quorum |
+| Encrypt | ECDH or GCM failure | Block release — check HSM and key material |
 | Distribute | Registry corruption | Detect via integrity check — restore from backup |
 | Download | Interrupted transfer | Resume via Range request |
 | Verify | Signature/hash/version failure | Discard image — re-download or wait for next release |

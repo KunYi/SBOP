@@ -64,6 +64,8 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 | 2 | `crypto_compute_hash` | `(&[u8], HashAlgo) → Result<[u8; 32], CryptoError>` | F, T, SEC | 100 ms (1 MB @ 100 MHz) | §4.2 |
 | 3 | `crypto_constant_time_compare` | `(&[u8], &[u8], usize) → bool` | T, SEC | O(len) cycles, no early return | §4.3 |
 | 4 | `crypto_derive_key` | `(&[u8], &[u8], &[u8], u16) → Result<KeyMaterial, CryptoError>` | F, T, SEC | Constant-time wrt IKM | §4.4 |
+| 5 | `crypto_ecdh` | `(KeyRef, &[u8; 32]) → Result<[u8; 32], CryptoError>` | F, T, SEC | Constant-time X25519, < 50 ms | §4.5 |
+| 6 | `crypto_aead_decrypt` | `(&KeyMaterial, &[u8; 12], &[u8], &[u8], &[u8; 16]) → Result<Vec<u8>, CryptoError>` | F, T, SEC | Constant-time GHASH, all-or-nothing | §4.6 |
 
 **Timing contract:** All crypto APIs must execute in constant time with respect to secret inputs. `crypto_verify_signature` and `crypto_constant_time_compare` must not leak whether the result is success or failure through timing.
 
@@ -159,6 +161,8 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 | --- | --- | --- | --- |
 | Full boot (INIT → EXECUTE) | < 300 ms | — | End-to-end timing |
 | Ed25519 verify | < 20 ms | Yes | TIM-001 |
+| X25519 ECDH | < 50 ms | Yes | TIM-002 |
+| AES-256-GCM decrypt (1 MB) | < 100 ms | Yes (GHASH) | TIM-002 |
 | SHA-256 (1 MB) | < 100 ms | Yes (fixed len) | TIM-002 |
 | Constant-time compare | O(len) cycles | Yes | TIM-002 |
 | Flash write (sector) | < 10 ms | — | Platform measurement |
@@ -169,14 +173,14 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 | Subsystem | Range | Count |
 | --- | --- | --- |
-| Boot (CRYPTO + PARSE + STATE + VERSION) | ERR-BOOT-xxx-001..099 | 25 |
-| Crypto (SIG + HASH + KDF + RNG) | ERR-CRYPTO-xxx-001..099 | 10 |
+| Boot (CRYPTO + PARSE + STATE + VERSION) | ERR-BOOT-xxx-001..099 | 32 |
+| Crypto (SIG + HASH + KDF + ECDH + AEAD + RNG) | ERR-CRYPTO-xxx-001..099 | 14 |
 | OTA (AUTH + DOWNLOAD + INSTALL + ACTIVATE + ROLL) | ERR-OTA-xxx-001..099 | 12 |
 | Identity (PROV + AUTH + IDENT + KEY + ATST + CLONE) | ERR-ID-xxx-001..099 | 14 |
 | Storage | ERR-STOR-xxx-001..099 | 4 |
 | Hardware | ERR-HW-xxx-001..099 | 7 |
 | SRP (AUTH + FRAME + CMD) | ERR-SRP-xxx-001..099 | 8 |
-| **Total** | | **80** |
+| **Total** | | **91** |
 
 → Full catalog: `../02_System_Design/Error_Code_Catalog.md`
 
@@ -239,6 +243,8 @@ Crypto:
   crypto_compute_hash(&[u8], HashAlgo)                         → Result<[u8; 32], CryptoError>
   crypto_constant_time_compare(&[u8], &[u8], usize)            → bool
   crypto_derive_key(&[u8], &[u8], &[u8], u16)                 → Result<KeyMaterial, CryptoError>
+  crypto_ecdh(KeyRef, &[u8; 32])                               → Result<[u8; 32], CryptoError>
+  crypto_aead_decrypt(&KeyMaterial, &[u8; 12], &[u8], &[u8], &[u8; 16]) → Result<Vec<u8>, CryptoError>
 
 OTA:
   ota_authenticate(DeviceID, &[u8; 32])       → Result<AuthToken, OTAError>

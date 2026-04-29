@@ -1,9 +1,9 @@
 # Boot Flow Pseudocode Specification
 
 **Document ID:** SUB-BOOT-FLOW-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -214,57 +214,267 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
 
     let payload = image_data[header.header_size .. header.header_size + header.image_size]
     let sig_block = parse_signature_block(image_data, header)
-    if sig_block == null: return Err(ERR-BOOT-PARSE-006)
+    let mut ota_verified = false
+
+    // ── Phase 4.5: OTA Decrypt + Re-encrypt (FLAG_OTA_PENDING) ──
+    // When FLAG_OTA_PENDING is set, the slot contains an OTA Image Package
+    // (OTAHeader || AES-256-GCM(Payload) || GCM_Tag || Ed25519_Signature).
+    // The bootloader must: ECDH → derive K_s → GCM decrypt → verify signature
+    // on plaintext → re-encrypt with KD_Storage. After this phase, the slot
+    // contains a standard SBOP image (device-unique encrypted).
+    if (header.flags & FLAG_OTA_PENDING) != 0:
+        state = OTA_DECRYPT
+        IWDG_REFRESH()
+
+        // ── Step 1: Parse OTA Image Package header ──
+        // The OTAHeader precedes the ImageHeader in the slot when FLAG_OTA_PENDING
+        // is set. Layout: OTAHeader (44 B) || EncryptedPayload || GCM_Tag (16 B)
+        //              || Ed25519_Signature (64 B)
+        let ota_header = parse_ota_header(image_data)
+        if ota_header == null: return Err(ERR-BOOT-PARSE-011)
+        if ota_header.magic != 0x534F5441: return Err(ERR-BOOT-PARSE-011)
+
+        // ── Step 2: X25519 ECDH key agreement ──
+        // Key agreement design (single OTA image for all devices):
+        //
+        //   All devices share the same X25519 key pair (KO).
+        //   KO_private is in secure element (same for all, per-device unique
+        //   is unnecessary since OTA encryption is defense-in-depth).
+        //   KO_public is registered with the Dev Team.
+        //
+        //   Packaging (Dev Team):        Device (boot):
+        //     eph_keypair = X25519_KeyGen()
+        //     SharedSecret = X25519(      SharedSecret = X25519(
+        //       eph_private,                KO_private,
+        //       KO_public)                   eph_public)
+        //
+        //   By ECDH symmetry, both derive the same SharedSecret.
+        //   Ephemeral public key (eph_public) is in OTA header.
+        //
+        //   Security: if KO_private is extracted from one device, all
+        //   devices' OTA encryption is compromised. Mitigation: OTA encryption
+        //   is defense-in-depth (TLS 1.3 is primary transport security). The
+        //   real security boundary is the Ed25519 firmware signature (KI).
+
+        // Read KO private key from secure element
+        let ko_private = key_material_load(KEY_REF_KO)
+
+        // Compute ECDH shared secret
+        let shared_secret = x25519_ecdh(ko_private, ota_header.ephemeral_pubkey)
+        if shared_secret == null: return Err(ERR-BOOT-CRYPTO-008)
+
+        // ── Step 3: Derive K_s and GCM nonce via HKDF ──
+        let fw_version_bytes = ota_header.firmware_version as [u8; 4]
+        let info = "SBOP-OTA-v1" || fw_version_bytes
+        let k_s = crypto_derive_key(shared_secret, salt="", info=info, output_len=32)
+        if k_s.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+
+        let nonce_info = "SBOP-OTA-NONCE-v1"
+        let gcm_nonce = crypto_derive_key(shared_secret, salt="", info=nonce_info, output_len=12)
+        if gcm_nonce.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+
+        // ── Step 4: AES-256-GCM decrypt the encrypted payload ──
+        let encrypted_payload = image_data[OTA_HEADER_SIZE + ota_header.aad_length ..
+                                           OTA_HEADER_SIZE + ota_header.aad_length + ota_header.payload_length]
+        let gcm_tag = image_data[OTA_HEADER_SIZE + ota_header.aad_length + ota_header.payload_length ..
+                                 OTA_HEADER_SIZE + ota_header.aad_length + ota_header.payload_length + 16]
+        let aad = image_data[OTA_HEADER_SIZE .. OTA_HEADER_SIZE + ota_header.aad_length]
+
+        IWDG_REFRESH()
+        let plaintext = aes_256_gcm_decrypt(
+            key = k_s.unwrap(),
+            nonce = gcm_nonce.unwrap(),
+            aad = aad,
+            ciphertext = encrypted_payload,
+            tag = gcm_tag
+        )
+        if plaintext.is_err(): return Err(ERR-BOOT-CRYPTO-008)  // GCM auth failure
+
+        // ── Step 5: Verify Ed25519 signature on plaintext ──
+        // The OTA Image Package's trailing Ed25519 signature covers the
+        // plaintext firmware (sign-then-encrypt ordering).
+        let ota_signature = image_data[OTA_HEADER_SIZE + ota_header.aad_length +
+                                        ota_header.payload_length + 16 ..
+                                        OTA_HEADER_SIZE + ota_header.aad_length +
+                                        ota_header.payload_length + 16 + 64]
+
+        // Parse the decrypted SBOP image: ImageHeader || Firmware || (SignatureBlock)
+        let decrypted_header = parse_header(plaintext)
+        if decrypted_header == null: return Err(ERR-BOOT-PARSE-001)
+        let decrypted_payload = plaintext[decrypted_header.header_size ..
+                                           decrypted_header.header_size + decrypted_header.image_size]
+
+        // Re-verify header HMAC over decrypted header
+        let decrypted_hmac_input = plaintext[0..56]
+        let decrypted_expected_hmac = crypto_hmac_sha256(KD, decrypted_hmac_input)[0..16]
+        if constant_time_compare(decrypted_header.header_hmac, decrypted_expected_hmac, 16) != true:
+            return Err(ERR-BOOT-PARSE-010)
+
+        // FIH: Verify the OTA Ed25519 signature on plaintext (header || firmware)
+        let ota_sig_data = plaintext[0 .. decrypted_header.header_size + decrypted_header.image_size]
+        let ota_sig_valid = ed25519_verify(ota_sig_data, ota_signature, LEGACY_KI_PUBLIC)
+        if ota_sig_valid != true: return Err(ERR-BOOT-CRYPTO-001)
+        let ota_sig_valid_v2 = ed25519_verify(ota_sig_data, ota_signature, LEGACY_KI_PUBLIC)
+        if ota_sig_valid_v2 != true: return Err(ERR-BOOT-CRYPTO-001)
+
+        IWDG_REFRESH()
+
+        // ── Step 6: Re-encrypt plaintext with KD_Storage (device-unique) ──
+        // KD_Storage = HKDF(KD, "SBOP-STORAGE-v1") — unique per device
+        let kd_storage = crypto_derive_key(KD, salt="", info="SBOP-STORAGE-v1", output_len=32)
+        if kd_storage.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+
+        // Generate random nonce for KD_Storage encryption (stored in slot metadata)
+        let storage_nonce = trng_random_bytes(12)
+        let storage_nonce_write_ok = storage_write_iv(slot, storage_nonce)
+        if storage_nonce_write_ok != true: return Err(ERR-STOR-WRITE-001)
+
+        // AES-256-GCM encrypt the plaintext SBOP image
+        // AAD binds the ciphertext to firmware version and slot
+        let storage_aad = decrypted_header.firmware_version as [u8; 4] || (slot as u8)
+        let re_encrypted = aes_256_gcm_encrypt(
+            key = kd_storage.unwrap(),
+            nonce = storage_nonce,
+            aad = storage_aad,
+            plaintext = plaintext
+        )
+        if re_encrypted.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+
+        let re_encrypted_payload = re_encrypted.ciphertext
+        let re_encrypted_tag    = re_encrypted.tag
+
+        IWDG_REFRESH()
+
+        // ── Step 7: Write re-encrypted image to slot ──
+        // Clear FLAG_OTA_PENDING — subsequent boots see a normal image
+        decrypted_header.flags &= ~FLAG_OTA_PENDING
+        decrypted_header.flags |= FLAG_ENCRYPTED  // Now device-unique encrypted
+
+        // Recompute header HMAC
+        let new_hmac_input = serialize_header_prefix(decrypted_header)[0..56]
+        let new_header_hmac = crypto_hmac_sha256(KD, new_hmac_input)[0..16]
+        decrypted_header.header_hmac = new_header_hmac
+
+        // Write: ImageHeader (80 B) || EncryptedPayload || GCM_Tag (16 B) || SignatureBlock
+        storage_erase_slot(slot)
+        storage_write(slot, 0, serialize_header(decrypted_header))
+        storage_write(slot, 80, re_encrypted_payload)
+        storage_write(slot, 80 + re_encrypted_payload.len, re_encrypted_tag)
+
+        // Construct SignatureBlock from the verified OTA signature
+        // (OTA signature is just the 64-byte Ed25519 value; wrap in SignatureBlock)
+        sig_block = SignatureBlock{
+            algorithm:  SIG_TYPE_ED25519,
+            key_index:  0xFF,  // Legacy single-key (OTA uses baked-in KI_public)
+            sig_length: 64,
+            reserved:   [0u8; 4],
+            public_key: LEGACY_KI_PUBLIC,
+            signature:  ota_signature,
+            crc32:      0,  // Computed below
+        }
+        sig_block.crc32 = crc32_compute(serialize_sig_block_prefix(sig_block))
+
+        // Write SignatureBlock to slot
+        storage_write(slot, 80 + re_encrypted_payload.len + 16, serialize_sig_block(sig_block))
+
+        // ── Step 8: Zeroize sensitive key material ──
+        secure_zeroize(shared_secret)
+        secure_zeroize(k_s)
+        secure_zeroize(gcm_nonce)
+        secure_zeroize(kd_storage)
+        secure_zeroize(ko_private)
+        secure_zeroize(plaintext)  // Plaintext firmware — must not persist in RAM
+
+        // ── Step 9: Reload the now-standard image from slot ──
+        // The slot now contains a normal SBOP image (KD_Storage encrypted).
+        // Reload so Phase 5-6 operate on the re-encrypted image.
+        image_data = storage_read_slot(slot)
+        if image_data == null: return Err(ERR-STOR-READ-001)
+        header = parse_header(image_data)
+        if header == null: return Err(ERR-BOOT-PARSE-001)
+        payload = image_data[header.header_size .. header.header_size + header.image_size]
+
+        // FLAG_OTA_PENDING is now cleared; OTA verification already done.
+        // Set flag to skip Phases 5-6 (signature + integrity already verified
+        // on plaintext before KD_Storage re-encryption).
+        ota_verified = true
+        IWDG_REFRESH()
+    else:
+        // Non-OTA path: sig_block was parsed in Phase 4
+        if sig_block == null: return Err(ERR-BOOT-PARSE-006)
+        ota_verified = false
+    // ── End of OTA Decrypt + Re-encrypt (Phase 4.5) ──
 
     // ── Phase 5: Verify Signature ──
     state = VERIFY_SIGNATURE
     IWDG_REFRESH()
 
-    // Parse signature block fields (key_index, public_key, signature, crc32)
-    // SignatureBlock CRC-32 validated in Phase 4 (parse_signature_block)
-    let key_index  = sig_block.key_index
-    let public_key = sig_block.public_key
-    let signature  = sig_block.signature
+    if !ota_verified:
+        // Parse signature block fields (key_index, public_key, signature, crc32)
+        // SignatureBlock CRC-32 validated in Phase 4 (parse_signature_block)
+        let key_index  = sig_block.key_index
+        let public_key = sig_block.public_key
+        let signature  = sig_block.signature
 
-    // Key fingerprint verification (NXP CSM-style multi-key, §3.10.9)
-    // Only for multi-key mode (key_index 0-3). Legacy mode (0xFF) uses baked-in key.
-    if key_index != 0xFF:
-        // Verify this key slot has NOT been revoked
-        let revocation = nor_spi_read_sr1_u16(KEY_REVOCATION_OFFSET)
-        if ((revocation >> key_index) & 1) == 0:
-            return Err(ERR-BOOT-CRYPTO-004)  // Key slot revoked
+        // Key fingerprint verification (NXP CSM-style multi-key, §3.10.9)
+        // Only for multi-key mode (key_index 0-3). Legacy mode (0xFF) uses baked-in key.
+        if key_index != 0xFF:
+            // Verify this key slot has NOT been revoked
+            let revocation = nor_spi_read_sr1_u16(KEY_REVOCATION_OFFSET)
+            if ((revocation >> key_index) & 1) == 0:
+                return Err(ERR-BOOT-CRYPTO-004)  // Key slot revoked
 
-        // Verify public key fingerprint matches OTP
-        let expected_fp = nor_spi_read_sr1(KEY_FINGERPRINT_BASE + key_index * 32, 32)
-        let actual_fp   = crypto_compute_hash(public_key, SHA256)
-        if constant_time_compare(actual_fp, expected_fp, 32) != true:
-            return Err(ERR-BOOT-CRYPTO-004)  // Fingerprint mismatch
-    else:
-        // Legacy single-key mode: use baked-in key from bootloader .rodata
-        public_key = LEGACY_KI_PUBLIC  // PC-ROP protected
+            // Verify public key fingerprint matches OTP
+            let expected_fp = nor_spi_read_sr1(KEY_FINGERPRINT_BASE + key_index * 32, 32)
+            let actual_fp   = crypto_compute_hash(public_key, SHA256)
+            if constant_time_compare(actual_fp, expected_fp, 32) != true:
+                return Err(ERR-BOOT-CRYPTO-004)  // Fingerprint mismatch
+        else:
+            // Legacy single-key mode: use baked-in key from bootloader .rodata
+            public_key = LEGACY_KI_PUBLIC  // PC-ROP protected
 
-    // Refreshed per 4 KB during streaming decrypt (see platform eval doc §3.13)
-
-    let sig_data = concat(image_data[0 .. header.header_size], payload)
-    let sig_valid = ed25519_verify(sig_data, signature, public_key)
-    if sig_valid != true: return Err(ERR-BOOT-CRYPTO-001)
-    // FIH redundant verify (fault injection defense)
-    let sig_valid_v2 = ed25519_verify(sig_data, signature, public_key)
-    if sig_valid_v2 != true: return Err(ERR-BOOT-CRYPTO-001)
-    IWDG_REFRESH()
+        let sig_data = concat(image_data[0 .. header.header_size], payload)
+        let sig_valid = ed25519_verify(sig_data, signature, public_key)
+        if sig_valid != true: return Err(ERR-BOOT-CRYPTO-001)
+        // FIH redundant verify (fault injection defense)
+        let sig_valid_v2 = ed25519_verify(sig_data, signature, public_key)
+        if sig_valid_v2 != true: return Err(ERR-BOOT-CRYPTO-001)
+        IWDG_REFRESH()
 
     // ── Phase 6: Verify Integrity ──
     state = VERIFY_INTEGRITY
-    let computed_hash = crypto_compute_hash(payload)         // HW SHA-256 (primary)
-    let computed_hash_sw = crypto_compute_hash_sw(payload)   // Software SHA-256 cross-check
-    // Both paths must agree — detects HW HASH glitch or FIH attack
-    if constant_time_compare(computed_hash, computed_hash_sw, 32) != true:
-        return Err(ERR-BOOT-CRYPTO-005)
-    let hash_match = constant_time_compare(computed_hash, header.hash, 32)
-    if hash_match != true: return Err(ERR-BOOT-CRYPTO-002)
-    // FIH redundant compare
-    let hash_match_v2 = constant_time_compare(computed_hash, header.hash, 32)
-    if hash_match_v2 != true: return Err(ERR-BOOT-CRYPTO-002)
+
+    if !ota_verified:
+        let computed_hash = crypto_compute_hash(payload)         // HW SHA-256 (primary)
+        let computed_hash_sw = crypto_compute_hash_sw(payload)   // Software SHA-256 cross-check
+        // Both paths must agree — detects HW HASH glitch or FIH attack
+        if constant_time_compare(computed_hash, computed_hash_sw, 32) != true:
+            return Err(ERR-BOOT-CRYPTO-005)
+        let hash_match = constant_time_compare(computed_hash, header.hash, 32)
+        if hash_match != true: return Err(ERR-BOOT-CRYPTO-002)
+        // FIH redundant compare
+        let hash_match_v2 = constant_time_compare(computed_hash, header.hash, 32)
+        if hash_match_v2 != true: return Err(ERR-BOOT-CRYPTO-002)
+    else:
+        // OTA path: integrity already verified in Phase 4.5 (GCM auth tag +
+        // Ed25519 signature on plaintext). KD_Storage encrypted payload hash
+        // does NOT match header.hash (which covers plaintext). Cross-check:
+        // verify that KD_Storage decrypt + SHA-256 matches header.hash.
+        let kd_storage = crypto_derive_key(KD, salt="", info="SBOP-STORAGE-v1", output_len=32)
+        let storage_nonce = storage_read_iv(slot)
+        let decrypted_check = aes_256_gcm_decrypt(
+            key = kd_storage.unwrap(),
+            nonce = storage_nonce,
+            aad = header.firmware_version as [u8; 4] || (slot as u8),
+            ciphertext = payload[0 .. payload.len - 16],
+            tag = payload[payload.len - 16 .. payload.len]
+        )
+        if decrypted_check.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+        let computed_hash = crypto_compute_hash(decrypted_check.unwrap())
+        if constant_time_compare(computed_hash, header.hash, 32) != true:
+            return Err(ERR-BOOT-CRYPTO-002)
+        secure_zeroize(kd_storage)
+        secure_zeroize(decrypted_check)
 
     // IV reuse detection: check if this (KD, IV_dev) pair was used before.
     // Reads last_iv_hash from frequent journal (ring buffer, no sector erase).
@@ -637,17 +847,22 @@ function handle_tamper_failure(tamper_state: TamperState) -> Never:
 | LOAD_IMAGE | image read OK | PARSE_HEADER | image_data != null |
 | LOAD_IMAGE | read error | FAILSAFE | ERR-STOR-READ-001 |
 | PARSE_HEADER | all fields valid | VERIFY_SIGNATURE | Section 2 rules R-IMG-001..006 |
+| PARSE_HEADER | FLAG_OTA_PENDING set | OTA_DECRYPT | OTA image detected |
+| PARSE_HEADER | all fields valid, not OTA | VERIFY_SIGNATURE | Section 2 rules R-IMG-001..006 |
 | PARSE_HEADER | any field invalid | FAILSAFE | ERR-BOOT-PARSE-001..006 |
-| VERIFY_SIGNATURE | signature valid | VERIFY_INTEGRITY | crypto_verify_signature == true |
+| OTA_DECRYPT | ECDH + decrypt + re-encrypt OK | VERIFY_SIGNATURE | OTA verified = true |
+| OTA_DECRYPT | GCM auth failure | FAILSAFE | ERR-BOOT-CRYPTO-008 |
+| OTA_DECRYPT | Signature invalid on plaintext | FAILSAFE | ERR-BOOT-CRYPTO-001 |
+| VERIFY_SIGNATURE | signature valid (or OTA skip) | VERIFY_INTEGRITY | crypto_verify_signature == true |
 | VERIFY_SIGNATURE | signature invalid | FAILSAFE | ERR-BOOT-CRYPTO-001 |
 | VERIFY_INTEGRITY | hash match | CHECK_VERSION | constant_time_compare == true |
 | VERIFY_INTEGRITY | hash mismatch | FAILSAFE | ERR-BOOT-CRYPTO-002 |
 | CHECK_VERSION | version >= stored | COMMIT_VERSION | firmware_version >= stored_version |
 | CHECK_VERSION | rollback detected | FAILSAFE | ERR-BOOT-VERSION-001 |
-| COMMIT_VERSION | write OK | MARK_ACTIVE | storage_write returns OK |
+| COMMIT_VERSION | write OK | MARK_TESTING | storage_write returns OK |
 | COMMIT_VERSION | write error | FAILSAFE | ERR-STOR-WRITE-001 |
-| MARK_ACTIVE | mark OK | LOCK_BOOT | slot status set to ACTIVE |
-| MARK_ACTIVE | mark error | FAILSAFE | ERR-STOR-WRITE-001 |
+| MARK_TESTING | mark OK | LOCK_BOOT | slot status set to TESTING |
+| MARK_TESTING | mark error | FAILSAFE | ERR-STOR-WRITE-001 |
 | LOCK_BOOT | lock OK | EXECUTE | Zone 1 memory protected |
 | EXECUTE (Pass 1) | RTC magic written + NVIC_SystemReset | Pass 2 INIT | IWDG stops on reset; AXI SRAM preserved |
 | PASS_2_INIT | RTC magic detected | JUMP_TO_APP | Application already in AXI SRAM |
@@ -697,6 +912,8 @@ Application:
 | I4 | constant_time_compare in Phase 6 | Prevents timing oracle on hash comparison |
 | I5 | tamper_detect_get_state() in INIT | Tamper checked before any firmware interaction |
 | I6 | key_zeroize in handle_tamper_failure | Keys destroyed before infinite wait |
+| I7 | secure_zeroize(K_s, SharedSecret, plaintext) in Phase 4.5 | OTA session keys zeroized immediately after re-encrypt |
+| I8 | FLAG_OTA_PENDING cleared after successful re-encrypt | One-time OTA decrypt — subsequent boots use KD_Storage fast path |
 
 ---
 
@@ -710,7 +927,8 @@ Application:
 | SELECT_SLOT | < 1 ms | Critical journal read (128 B) + frequent journal read (32 B) |
 | LOAD_IMAGE | < 100 ms | Depends on image size and flash speed |
 | PARSE_HEADER | < 1 ms | Fixed-size parse |
-| VERIFY_SIGNATURE | < 50 ms | Ed25519 verify |
+| OTA_DECRYPT (X25519 + GCM + re-encrypt) | < 200 ms | ECDH + HKDF + AES-256-GCM decrypt + KD_Storage re-encrypt + flash write |
+| VERIFY_SIGNATURE | < 50 ms | Ed25519 verify (skipped if OTA already verified) |
 | VERIFY_INTEGRITY | < 100 ms | SHA-256 over payload + IV reuse check |
 | CHECK_VERSION | < 1 ms | Simple integer comparison |
 | COMMIT_VERSION | < 10 ms | SR1 OTP write (new version only) |
@@ -725,7 +943,10 @@ Application:
 | INIT (detect RTC magic) | ~2 ms | Platform init (minimal) |
 | Jump to prepared application | ~3 ms | VTOR set, workspace clear, MSP+PC load |
 
-**Total boot budget target:** < 200 ms (Pass 1) + ~5 ms (Pass 2) ≈ < 205 ms from cold reset to firmware execution. Well under the 300 ms SBOP target.
+**Total boot budget target (non-OTA):** < 200 ms (Pass 1) + ~5 ms (Pass 2) ≈ < 205 ms from cold reset to firmware execution.
+**Total boot budget target (OTA first boot):** < 400 ms (Pass 1 with Phase 4.5 ECDH + GCM decrypt + KD_Storage re-encrypt) + ~5 ms (Pass 2) ≈ < 405 ms.
+
+The OTA first boot exceeds the 300 ms SBOP general target; this is acceptable because OTA first boot is a one-time event per update. Subsequent boots of the same image use the KD_Storage-encrypted fast path (~205 ms).
 
 ---
 
@@ -930,6 +1151,7 @@ function measured_boot_extend(prev_pcr: &[u8; 32], image_hash: &[u8; 32],
 |-------|-----------------|-----------------|
 | Normal boot (Phase 11 EXECUTE) | **Not written** | `append(0x01, flags, iv_hash, pcr)` |
 | OTA writes new image to slot | Write (slot status → PENDING) | Not written |
+| OTA decrypt + re-encrypt (Phase 4.5) | Write (re_encrypt_state → COMMITTED, slot data) | Not written |
 | First boot after OTA (Phase 9) | Write (slot status → TESTING) | Not written |
 | `boot_set_confirmed()` | Write (slot status → ACTIVE) | `append(0x02, 0x00, iv_hash)` |
 | Slot verification fails | Write (slot status → INVALID) | Not written |
