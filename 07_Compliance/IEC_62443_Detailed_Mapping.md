@@ -159,9 +159,9 @@ SBOP targets **SL 2** with capability for **SL 3** when deployed with a hardware
 | Device Core (Zone 1) | SL 3 | SL 2 | Need hardware secure element for SL 3 key protection |
 | Device Application (Zone 2) | SL 2 | SL 2 | — |
 | Backend Infrastructure (Zone 3) | SL 3 | SL 2 | Need formal backend security assessment |
-| Manufacturing (Zone 4) | SL 2 | SL 1 | → `Manufacturing_Security.md` (Phase 3.5) |
-| Network (Zone 5) | SL 2 | SL 1 | Need transport security specification |
-| Toolchain (Zone 6) | SL 3 | SL 1 | → `Supply_Chain_Security.md` (Phase 3.1) |
+| Manufacturing (Zone 4) | SL 2 | SL 2 | Physical access, isolated network, operator attribution, immutable audit log per `Manufacturing_Security.md` |
+| Network (Zone 5) | SL 2 | SL 2 | Application-layer crypto (AES-256-CTR + Ed25519 via X25519 ECDH) provides integrity + confidentiality above TLS 1.3. Transport is untrusted by design. |
+| Toolchain (Zone 6) | SL 3 | SL 2 | HSM signing, SBOM, reproducible builds, signed commits specified. SL 3 gap: formal build attestation + air-gap verification |
 
 ---
 
@@ -199,7 +199,7 @@ SBOP targets **SL 2** with capability for **SL 3** when deployed with a hardware
 | Gap ID | Description | Impact | Mitigation |
 | --- | --- | --- | --- |
 | GAP-62443-001 | No formal SL-C (capability) rating per component | Medium | → `CAL_SLT_Definitions.md` (Phase 2.5) |
-| GAP-62443-002 | Toolchain security (Zone 6) currently SL 1; target SL 3 | High | → `Supply_Chain_Security.md` (Phase 3.1) |
-| GAP-62443-003 | Manufacturing zone (Zone 4) SL-A below SL-T | Medium | → `Manufacturing_Security.md` (Phase 3.5) |
-| GAP-62443-004 | No transport security specification for Network zone | Medium | → Network conduit security requirements |
+| GAP-62443-002 | Toolchain security (Zone 6) SL 2 achieved; SL 3 target remains | Medium | SL 2 met via HSM signing, SBOM, reproducible builds. SL 3 needs formal build attestation + air-gap verification. |
+| GAP-62443-003 | Manufacturing zone (Zone 4) SL-A below SL-T | Closed | `Manufacturing_Security.md` covers physical, network, operator controls with 10-step provisioning protocol — SL-A raised to SL 2 |
+| GAP-62443-004 | No transport security specification for Network zone | Closed | Application-layer crypto (AES-256-CTR + Ed25519) provides integrity + confidentiality. TLS 1.3 is redundant — payload is encrypted and signed end-to-end. Network is untrusted by design. |
 | GAP-62443-005 | No DoS protection beyond fail-safe | Low | Resource limits specification |

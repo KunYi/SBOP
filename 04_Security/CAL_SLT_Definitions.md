@@ -81,8 +81,8 @@ IEC 62443 SL maps to ISO 21434 as follows:
 | Zone 1: Device Core | **SL 3** | Professional attacker with moderate resources, system-specific skills | Root of trust; compromise is persistent and irreversible. Must resist sophisticated attack. |
 | Zone 2: Device Application | **SL 2** | Hacker with generic skills, low resources | Isolated from root of trust by Zone 1 boundary. Compromise contained. |
 | Zone 3: Backend Infrastructure | **SL 3** | Professional attacker with moderate resources | Controls fleet-scale firmware distribution. High-value target. |
-| Zone 4: Manufacturing | **SL 2** | Insider with low resources | Physically secured + time-limited exposure. Enhanced controls sufficient. |
-| Zone 5: Network | **SL 2** | Hacker with generic skills | Untrusted by design. End-to-end protection at application layer. |
+| Zone 4: Manufacturing | **SL 2** | Insider with low resources | Physically secured + time-limited exposure. Full access control, operator attribution, two-person rule, isolated provisioning network, and immutable audit log specified. |
+| Zone 5: Network | **SL 2** | Hacker with generic skills | Untrusted by design. Payload confidentiality and integrity are provided at the application layer (AES-256-CTR + Ed25519 via X25519 ECDH). Network is a transparent pipe — compromise of the transport does not expose plaintext or allow forgery. TLS 1.3 is redundant and not required. |
 | Zone 6: Toolchain | **SL 3** | Professional attacker, potential nation-state | Supply chain compromise affects entire fleet. Must resist sophisticated attack. |
 
 ---
@@ -96,9 +96,9 @@ IEC 62443 SL maps to ISO 21434 as follows:
 | Zone 1 | SL 3 | SL 2 | SL 2→3 | Hardware secure element for key protection, side-channel countermeasures |
 | Zone 2 | SL 2 | SL 2 | — | None |
 | Zone 3 | SL 3 | SL 2 | SL 2→3 | Formal backend security assessment, pen testing |
-| Zone 4 | SL 2 | SL 1 | SL 1→2 | Manufacturing security specification (Phase 3.5) |
-| Zone 5 | SL 2 | SL 1 | SL 1→2 | Transport security specification |
-| Zone 6 | SL 3 | SL 1 | SL 1→3 | Supply chain security specification (Phase 3.1) |
+| Zone 4 | SL 2 | SL 2 | — | None — SL-T met |
+| Zone 5 | SL 2 | SL 2 | — | None — SL-T met (application-layer crypto obviates transport security) |
+| Zone 6 | SL 3 | SL 2 | SL 2→3 | HSM signing, SBOM, reproducible builds, signed commits all specified. SL 3 requires formal build attestation and air-gap verification. |
 
 ### 5.2 Control-to-SL Mapping
 
