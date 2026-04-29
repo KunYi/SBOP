@@ -16,7 +16,7 @@ Defines the Crypto subsystem architecture, interfaces, and responsibilities. The
 ## 2. Scope
 
 **Includes:**
-- Signature verification (ECDSA P-256, Ed25519)
+- Signature verification (Ed25519)
 - Hash computation (SHA-256)
 - Key derivation (HKDF-SHA256)
 - Constant-time comparison for security-critical checks
@@ -40,7 +40,7 @@ Defines the Crypto subsystem architecture, interfaces, and responsibilities. The
 │  ┌─────────────┐  ┌───────────────┐          │
 │  │  Signature   │  │    Hash       │          │
 │  │  Verifier    │  │   Engine      │          │
-│  │  (ECDSA /    │  │  (SHA-256)    │          │
+│  │  (Ed25519    │  │  (SHA-256)    │          │
 │  │   Ed25519)   │  │               │          │
 │  └──────┬───────┘  └───────┬───────┘          │
 │         │                  │                  │
@@ -73,7 +73,7 @@ Defines the Crypto subsystem architecture, interfaces, and responsibilities. The
 
 | # | Principle | Implementation |
 | --- | --- | --- |
-| 1 | Standard algorithms only | ECDSA P-256, Ed25519, SHA-256, HKDF — no custom crypto |
+| 1 | Standard algorithms only | Ed25519, SHA-256, HKDF — no custom crypto |
 | 2 | Constant-time on all security paths | No data-dependent timing in verify, compare, derive |
 | 3 | Keys never exposed | KeyRef opaque handles only; raw key material never returned |
 | 4 | Deterministic verification | Same input → same output; no nonce/randomness in verification |
@@ -86,7 +86,7 @@ Defines the Crypto subsystem architecture, interfaces, and responsibilities. The
 
 | Function | Consumer | Description |
 | --- | --- | --- |
-| `crypto_verify_signature(data, sig, key)` | Boot, OTA | Verify ECDSA P-256 or Ed25519 signature |
+| `crypto_verify_signature(data, sig, key)` | Boot, OTA | Verify Ed25519 signature |
 | `crypto_compute_hash(data)` | Boot, OTA | SHA-256 hash computation |
 | `crypto_constant_time_compare(a, b)` | Boot | Constant-time memory comparison |
 | `crypto_derive_key(prk, info, len)` | Identity | HKDF key derivation |
@@ -100,7 +100,7 @@ Defines the Crypto subsystem architecture, interfaces, and responsibilities. The
 
 | SL | Crypto Requirement | Verification |
 | --- | --- | --- |
-| SL 1 | ECDSA P-256 or Ed25519, SHA-256 | TEST-CRYPTO-001, TEST-CRYPTO-002 |
+| SL 1 | Ed25519, SHA-256 | TEST-CRYPTO-001, TEST-CRYPTO-002 |
 | SL 2 | + Constant-time hash comparison | TIM-001 |
 | SL 3 | + Constant-time signature verification, masking | TIM-002, TVLA |
 | SL 4 | + Hardware security module for key operations | Physical pentest, formal verification |
@@ -125,7 +125,7 @@ All crypto errors follow the ERR-CRYPTO-* scheme defined in `Error_Code_Catalog.
 | ARM Cortex-M (no TrustZone) | wolfSSL or mbedTLS (software only) |
 | RISC-V | OpenTitan crypto IP or libsodium |
 | ESP32 | Hardware crypto via ESP-IDF |
-| No HW acceleration | TweetNaCl (Ed25519) + Relic (ECDSA) |
+| No HW acceleration | TweetNaCl (Ed25519) or monocypher |
 
 ---
 

@@ -201,7 +201,7 @@ Step 7: Register with backend
 | SELECT_SLOT | Read boot slot selection from metadata region (atomic). |
 | LOAD_IMAGE | DMA from flash to RAM. Validate minimum size. |
 | PARSE_HEADER | Parse `ImageHeader` struct. Validate all fields per `Data_Structures.md` §3.2. |
-| VERIFY_SIGNATURE | Use hardware crypto accelerator if available. ECDSA P-256 or Ed25519. Must be constant-time per `Side_Channel_Countermeasures.md`. |
+| VERIFY_SIGNATURE | Use hardware crypto accelerator if available. Ed25519. Must be constant-time per `Side_Channel_Countermeasures.md`. |
 | VERIFY_INTEGRITY | SHA-256 via hardware accelerator. Compare with `constant_time_compare`. |
 | CHECK_VERSION | Read version counter from OTP/secure flash. Redundant read for fault detection. |
 | COMMIT_VERSION | Write new version to OTP if higher. |
@@ -245,8 +245,7 @@ OTA rollback is triggered by boot failure detection:
 
 | Algorithm | Implementation | Notes |
 | --- | --- | --- |
-| ECDSA P-256 | mbedTLS `ecdsa.h` or wolfSSL `ecc.h` | Must verify in constant time |
-| Ed25519 | libsodium or TweetNaCl | Preferred for new implementations |
+| Ed25519 | libsodium, TweetNaCl, or monocypher | Must verify in constant time per RFC 8032 §5.1 |
 | SHA-256 | mbedTLS `sha256.h` or wolfSSL `sha256.h` | Hardware acceleration recommended |
 | HKDF | mbedTLS `hkdf.h` or wolfSSL `hkdf.h` | Salt must be random + device-specific |
 | TRNG | MCU hardware TRNG with health tests | NIST SP 800-90B compliant |

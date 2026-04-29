@@ -115,7 +115,7 @@ Debug Host ──→ Device Debug Port
 | Protection | Applied To |
 |------------|------------|
 | TLS 1.3 + mutual auth | All network communication |
-| ECDSA / Ed25519 signature | Firmware images, attestation proofs |
+| Ed25519 signature | Firmware images, attestation proofs |
 | SHA-256 hash | Firmware images (integrity) |
 | HKDF derivation | All keys below KR |
 | Encrypted channel | Provisioning (station → device) |

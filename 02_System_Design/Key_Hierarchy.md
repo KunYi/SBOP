@@ -36,7 +36,7 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
  │           │  Flash encryption key (optional, platform-dependent)
  │           │  256-bit, used only when flash encryption is enabled
  │           │
- └──→ KI (Image Signing Key) — ECDSA P-256 / Ed25519 key pair
+ └──→ KI (Image Signing Key) — Ed25519 key pair
        │  Firmware signing, private key in HSM
        │  Public key embedded in bootloader at build time
        │
@@ -54,8 +54,8 @@ KR (Root Key) — 256-bit symmetric, FIPS 140-2 L3+ HSM
 | KD_Auth | Symmetric | 256-bit | HKDF(KD, "SBOP-AUTH-v1") | Secure element / TEE | Per-device |
 | KD_Debug | Symmetric | 256-bit | HKDF(KD, "SBOP-DEBUG-v1") | Secure element / TEE | Per-device |
 | KD_Storage | Symmetric | 256-bit | HKDF(KD, "SBOP-STORAGE-v1") | Secure element / TEE | Per-device (optional) |
-| KI (private) | ECDSA P-256 / Ed25519 | 256-bit | Generated in HSM | HSM | Per-firmware-version or per-release |
-| KI (public) | ECDSA P-256 / Ed25519 | 256-bit / 256-bit | — | Bootloader (Zone 1, read-only) | Per-firmware-version |
+| KI (private) | Ed25519 | 256-bit | Generated in HSM | HSM | Per-firmware-version or per-release |
+| KI (public) | Ed25519 | 256-bit / 256-bit | — | Bootloader (Zone 1, read-only) | Per-firmware-version |
 
 ---
 

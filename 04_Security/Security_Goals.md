@@ -14,7 +14,7 @@
 Only trusted, authorized firmware shall execute.
 
 **Enforced by:**
-- Cryptographic signature verification (ECDSA P-256 / Ed25519)
+- Cryptographic signature verification (Ed25519)
 - Root of trust anchored in KR during provisioning
 - All images must chain to KR through key hierarchy
 

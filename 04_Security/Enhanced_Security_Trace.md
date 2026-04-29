@@ -107,9 +107,9 @@ Risk values are shown as: TARA risk level (→ `TARA_Methodology.md`) / Internal
 
 | Attack | Risk | Mitigation | Requirement | Test |
 | --- | --- | --- | --- | --- |
-| A8.1.1 Timing oracle (signature verify) | — / High (12) | Constant-time ECDSA/Ed25519 verification | REQ-SR-SCH-001 | TIM-002 |
+| A8.1.1 Timing oracle (signature verify) | — / High (12) | Constant-time Ed25519 verification | REQ-SR-SCH-001 | TIM-002 |
 | A8.1.2 Timing oracle (hash compare) | — / High (9) | `constant_time_compare` — no early return | REQ-SR-SCH-001 | TIM-001 |
-| A8.2.1 SPA on ECDSA verification | — / High (8) | Fixed-sequence operations, balanced point ops | SCH-SPA-001..003 | TVLA (FvR) |
+| A8.2.1 SPA on Ed25519 verification | — / High (8) | Fixed-sequence operations, balanced point ops | SCH-SPA-001..003 | TVLA (FvR) |
 | A8.2.2 DPA on key derivation | — / High (8) | Masking, blinding (SL 3+) | SCH-DPA-001, SCH-DPA-002 | TVLA (FvR) |
 | A8.3.1 EM leakage from crypto ops | — / — | EM shielding, balanced routing, low-emission logic | REQ-SR-SCH-001 | EM emanation test (SL 3+) |
 

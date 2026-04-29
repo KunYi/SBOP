@@ -26,7 +26,7 @@ Purpose: Verify cryptographic signature over firmware image.
 
 Preconditions:
   - data points to image payload (header + payload, excluding signature block)
-  - signature.algorithm matches one of the supported algorithms (ECDSA P-256 or Ed25519)
+  - signature.algorithm matches one of the supported algorithms (Ed25519)
   - public_key resolves to a valid verification key (KI public key)
 
 Postconditions:

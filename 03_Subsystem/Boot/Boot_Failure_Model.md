@@ -36,7 +36,7 @@ Defines all boot failure scenarios, their error codes, system response, and reco
 
 ### F-BOOT-002: Signature Verification Failure
 
-**Description:** ECDSA P-256 or Ed25519 signature verification fails for the loaded image.
+**Description:** Ed25519 signature verification fails for the loaded image.
 
 **Detection:** Cryptographic signature verification returns false or error.
 

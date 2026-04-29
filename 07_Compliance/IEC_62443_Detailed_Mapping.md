@@ -57,7 +57,7 @@ SBOP targets **SL 2** with capability for **SL 3** when deployed with a hardware
 | CR 1.6 | Wireless access management | N/A (SBOP does not manage wireless) | — |
 | CR 1.7 | Strength of password-based authentication | → `03_Subsystem/Crypto/Crypto_Algorithms.md` (key strength) | SL 3 |
 | CR 1.8 | Public key infrastructure certificates | → `02_System_Design/Key_Hierarchy.md` | SL 2 |
-| CR 1.9 | Strength of public key authentication | → ECDSA P-256 / Ed25519 per `Crypto_Algorithms.md` | SL 3 |
+| CR 1.9 | Strength of public key authentication | → Ed25519 per `Crypto_Algorithms.md` | SL 3 |
 | CR 1.10 | Authenticator feedback | N/A (no interactive auth on device) | — |
 | CR 1.11 | Unsuccessful login attempts | → `03_Subsystem/Identity/Identity_Failure_Model.md` | SL 2 |
 | CR 1.12 | System use notification | N/A | — |

@@ -207,7 +207,7 @@ Regardless of debug access level, SBOP's key material (KR, KD, signing keys) mus
 
 | Requirement | Description |
 | --- | --- |
-| DBG-UL-001 | Unlock token must be signed by backend (ECDSA or Ed25519) |
+| DBG-UL-001 | Unlock token must be signed by backend (Ed25519) |
 | DBG-UL-002 | Token must be single-use (device records used token IDs) |
 | DBG-UL-003 | Token expiry must not exceed 24 hours from issuance |
 | DBG-UL-004 | Debug relock must occur on any of: token expiry, device reset, power cycle |

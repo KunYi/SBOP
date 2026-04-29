@@ -210,7 +210,7 @@ Per IEC 62304, SBOP must identify and assess third-party software integrated int
 
 | Component Type | Examples | SOUP Assessment |
 | --- | --- | --- |
-| Cryptographic library | ECDSA/SHA-256 implementation | Must be validated (FIPS 140-3 or equivalent) |
+| Cryptographic library | Ed25519/SHA-256 implementation | Must be validated (FIPS 140-3 or equivalent) |
 | TLS stack | mbedTLS, wolfSSL | Must be validated for medical use |
 | RTOS | FreeRTOS, Zephyr (if used) | Safety certification status |
 | Hardware abstraction | MCU vendor HAL | Assess for safety impact |

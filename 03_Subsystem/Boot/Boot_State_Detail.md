@@ -70,7 +70,7 @@ Failure: → FAILSAFE
 
 ### VERIFY_SIGNATURE
 
-- Verify ECDSA P-256 or Ed25519 signature against KI public key
+- Verify Ed25519 signature against KI public key
 - Signature covers ImageHeader + ImageBody
 - Constant-time verification (no early exit)
 
@@ -177,7 +177,7 @@ No transitions from EXECUTE (boot is complete).
 | SELECT_SLOT | 5 ms | Metadata reads from flash |
 | LOAD_IMAGE | 50 ms | Flash read, bounded by image header size |
 | PARSE_HEADER | 2 ms | Fixed-size struct parsing |
-| VERIFY_SIGNATURE | 100 ms | ECDSA P-256; Ed25519 faster |
+| VERIFY_SIGNATURE | 100 ms | Ed25519 |
 | VERIFY_INTEGRITY | 200 ms | SHA-256 over full image (size-dependent) |
 | CHECK_VERSION | 2 ms | OTP read |
 | COMMIT_VERSION | 10 ms | OTP write (if needed) |

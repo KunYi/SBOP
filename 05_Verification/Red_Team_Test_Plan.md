@@ -96,13 +96,13 @@ Success Criteria (Defense):
 Test ID: RED-CRYPTO-001
 Profile: Professional Team (SL 3)
 Method:
-  1. Attempt to generate valid ECDSA P-256 signature without private key
+  1. Attempt to generate valid Ed25519 signature without private key
   2. Attempt to generate valid Ed25519 signature without private key
   3. Attempt hash collision: find m1 ≠ m2 where SHA-256(m1) = SHA-256(m2)
   4. Attempt length extension attack on SHA-256
 
 Expected Defense:
-  - ECDSA P-256/Ed25519 provide existential unforgeability
+  - Ed25519 provide existential unforgeability
   - SHA-256 collision resistance prevents meaningful attacks
 
 Success Criteria (Defense):
@@ -329,7 +329,7 @@ Success Criteria (Defense):
 Test ID: RED-SCH-002
 Profile: Nation-State Lab (SL 4)
 Method:
-  1. Collect power traces during key derivation (HKDF) and ECDSA verification
+  1. Collect power traces during key derivation (HKDF) and Ed25519 verification
   2. 100K-1M traces
   3. Apply CPA (Correlation Power Analysis) targeting KD and KI intermediates
   4. Attempt key recovery

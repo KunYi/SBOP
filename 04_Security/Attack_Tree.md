@@ -97,7 +97,7 @@ G-ROOT: Compromise Device Trust
 │   │   ├── A8.1.1: Timing oracle on signature verification
 │   │   └── A8.1.2: Timing oracle on hash comparison
 │   ├── A8.2: Power analysis
-│   │   ├── A8.2.1: SPA on ECDSA verification
+│   │   ├── A8.2.1: SPA on Ed25519 verification
 │   │   └── A8.2.2: DPA on key derivation
 │   └── A8.3: EM analysis
 │       └── A8.3.1: EM leakage from crypto operations

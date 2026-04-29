@@ -19,7 +19,7 @@ Defines how firmware images are created, transferred, validated, and executed, m
 |-------|-------|--------|--------|--------------|
 | 1. Build | Build pipeline | Compile source, link, generate binary | Unsigned firmware binary | Reproducible build verification |
 | 2. Package | Build pipeline | Compute SHA-256 hash, construct ImageHeader | Packaged (unsigned) image | Hash verification |
-| 3. Sign | HSM | ECDSA P-256 / Ed25519 sign hash, attach signature | Signed firmware image | Signature self-test |
+| 3. Sign | HSM | Ed25519 sign hash, attach signature | Signed firmware image | Signature self-test |
 | 4. Distribute | Backend | Store in firmware registry, assign version, publish | Published firmware image | Registry integrity check |
 | 5. Download | Device (OTA) | Download via TLS 1.3 mutual auth to buffer | Downloaded image (unverified) | TLS integrity |
 | 6. Verify | Device (Boot/OTA) | Verify signature + hash + version (independent of backend) | Verified image | Full re-verification |
@@ -45,7 +45,7 @@ Defines how firmware images are created, transferred, validated, and executed, m
 ### 3.3 Sign (HSM)
 
 - Hash from ImageHeader sent to HSM (air-gapped or network-isolated)
-- HSM signs with KI private key (ECDSA P-256 or Ed25519)
+- HSM signs with KI private key (Ed25519)
 - Signature appended to image: ImageHeader + ImageBody + SignatureBlock
 - Signing ceremony: multi-party authorization, audit logged
 - Post-signing: signature self-test (verify with KI public)
@@ -68,7 +68,7 @@ Defines how firmware images are created, transferred, validated, and executed, m
 ### 3.6 Verify (Device)
 
 - **Device always re-verifies independently of backend.** Backend compromise cannot affect device.
-- Verify signature (ECDSA P-256 / Ed25519) against KI public key in Zone 1
+- Verify signature (Ed25519) against KI public key in Zone 1
 - Verify SHA-256 hash over image body
 - Check version against OTP counter (anti-rollback)
 - All checks passed → image written to inactive slot

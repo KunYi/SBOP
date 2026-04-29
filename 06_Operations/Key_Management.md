@@ -34,7 +34,6 @@ Root Key (KR) ──── HKDF ──→ Device Key (KD)
 | KD_Auth | Symmetric (256-bit) | HKDF(KD, "AUTH") | Secure element | Session-derived | Per session |
 | KD_Debug | Symmetric (256-bit) | HKDF(KD, "DEBUG") | Secure element | Device lifetime | Per-device via KR rotation |
 | KD_Storage | Symmetric (256-bit) | HKDF(KD, "STORAGE") | Secure element | Device lifetime | Per-device via KR rotation |
-| KI (ECDSA P-256) | Asymmetric key pair | HSM TRNG | HSM | Per firmware version | Per release |
 | KI (Ed25519) | Asymmetric key pair | HSM TRNG | HSM | Per firmware version | Per release |
 
 ---
@@ -97,7 +96,7 @@ Prerequisites:
 
 Procedure:
   1. Operators authenticate to HSM (quorum required)
-  2. HSM generates KI key pair (ECDSA P-256 or Ed25519)
+  2. HSM generates KI key pair (Ed25519)
   3. KI private key never exported
   4. KI public key exported for distribution:
      - Embedded in bootloader (Zone 1) at build time

@@ -31,7 +31,7 @@ KR (Root Key) ─── 256-bit symmetric key, stored in HSM
  │    └── KD_Storage = HKDF-Expand(KD, "STORAGE", 32)
  │         │   Optional flash encryption key
  │
- └── KI (Image Signing Key) ─── ECDSA P-256 / Ed25519 key pair
+ └── KI (Image Signing Key) ─── Ed25519 key pair
       │                          Generated in HSM, private key never exported
       │
       └── KI_public ─── Embedded in bootloader at build time

@@ -24,7 +24,7 @@ Aligned with `State_Machine.md` and `Boot_Flow_Pseudocode.md`:
 | BOOT_SELECT_SLOT | Select highest-version valid slot (A or B) |
 | BOOT_LOAD_IMAGE | Load image header from selected slot |
 | BOOT_PARSE_HEADER | Parse and validate ImageHeader struct |
-| BOOT_VERIFY_SIGNATURE | ECDSA P-256 / Ed25519 signature verification |
+| BOOT_VERIFY_SIGNATURE | Ed25519 signature verification |
 | BOOT_VERIFY_INTEGRITY | SHA-256 hash over image body, constant-time compare |
 | BOOT_CHECK_VERSION | Compare version against OTP counter |
 | BOOT_COMMIT_VERSION | Burn OTP counter (if version > current) |

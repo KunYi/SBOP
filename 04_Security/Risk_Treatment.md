@@ -46,7 +46,7 @@ Defines how identified risks are treated: mitigated, accepted, transferred, or a
 | --- | --- | --- | --- | --- |
 | A1.1.1 Skip verification (fault injection) | Critical (12) | Mitigate | Direct path to untrusted execution | Redundant verification, glitch detection, tamper response |
 | A1.1.2 Exploit parsing bug | High (9) | Mitigate | Parser is first line of defense | Input validation, fuzzing, no fallback parsing |
-| A1.2.1 Break crypto | Low (3) | Accept (monitored) | Standard algorithms (ECDSA, Ed25519) with no known practical breaks | CVE monitoring, crypto agility |
+| A1.2.1 Break crypto | Low (3) | Accept (monitored) | Standard algorithms (Ed25519) with no known practical breaks | CVE monitoring, crypto agility |
 | A1.2.2 Steal signing key | High (12) | Mitigate | Key compromise = full compromise | HSM, quorum, air-gapped signing |
 | A1.3.1 Tamper during transfer | Medium (6) | Mitigate | MITM is feasible attack | End-to-end signing, device-side verification |
 | A1.3.2 Backend compromise | High (9) | Mitigate | Backend controls fleet | Access control, audit logging, deployment policy |
@@ -72,9 +72,9 @@ Defines how identified risks are treated: mitigated, accepted, transferred, or a
 
 | Leaf Node | Risk Score | Treatment | Rationale | Controls Applied |
 | --- | --- | --- | --- | --- |
-| A8.1.1 Timing oracle on signature | Medium (6) | Mitigate | Remote timing is noisy but real | Constant-time ECDSA/Ed25519 |
+| A8.1.1 Timing oracle on signature | Medium (6) | Mitigate | Remote timing is noisy but real | Constant-time Ed25519 |
 | A8.1.2 Timing oracle on hash compare | Medium (6) | Mitigate | Local timing oracle feasible | `constant_time_compare` |
-| A8.2.1 SPA on ECDSA | Medium (4) | Mitigate at SL 3+ | Requires physical access + equipment | Fixed-sequence ops, balanced point ops |
+| A8.2.1 SPA on Ed25519 | Medium (4) | Mitigate at SL 3+ | Requires physical access + equipment | Fixed-sequence ops, balanced point ops |
 | A8.2.2 DPA on key derivation | High (6) | Mitigate at SL 3+ | High-trace-count attack | Masking, blinding |
 
 ### 3.5 A11: Zone Boundary Violation

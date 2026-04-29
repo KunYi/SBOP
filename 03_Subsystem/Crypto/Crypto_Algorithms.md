@@ -1,9 +1,9 @@
 # Cryptographic Algorithms Specification
 
 **Document ID:** SUB-CRYPTO-ALG-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -15,21 +15,7 @@ Defines all cryptographic algorithms, parameters, and constraints used in SBOP. 
 
 ## 2. Digital Signature
 
-### 2.1 Primary Algorithm: ECDSA P-256
-
-| Parameter | Value |
-| --- | --- |
-| Algorithm | ECDSA (Elliptic Curve Digital Signature Algorithm) |
-| Curve | NIST P-256 (secp256r1) |
-| Hash | SHA-256 |
-| Key size | 256-bit private, 512-bit public (uncompressed) |
-| Signature size | ~70-72 bytes (ASN.1 DER), 64 bytes (raw r||s) |
-| Standard | FIPS 186-5, NIST SP 800-186 |
-| Security level | 128-bit (classical) |
-
-**Usage:** Firmware signature verification on device. KI private key signs; device verifies with KI public key.
-
-### 2.2 Secondary Algorithm: Ed25519
+### 2.1 Algorithm: Ed25519
 
 | Parameter | Value |
 | --- | --- |
@@ -38,16 +24,18 @@ Defines all cryptographic algorithms, parameters, and constraints used in SBOP. 
 | Hash | SHA-512 (internal) |
 | Key size | 256-bit private, 256-bit public |
 | Signature size | 64 bytes (fixed) |
-| Standard | RFC 8032, NIST SP 800-186 |
+| Standard | RFC 8032, NIST SP 800-186 (FIPS 186-5) |
 | Security level | 128-bit (classical) |
 
-**Usage:** Preferred for new implementations. Simpler than ECDSA, no randomness needed for signing, more resistant to implementation errors.
+**Usage:** Firmware signature verification on device. KI private key signs; device verifies with KI public key. Ed25519 is the single required signature algorithm — simpler than ECDSA, deterministic (no RNG needed for signing), fixed-size signatures, and included in FIPS 186-5.
 
-### 2.3 Algorithm Selection
-
-The `ImageHeader.algorithm` field selects the verification algorithm. Devices must implement at least one; implementing both is recommended for crypto agility.
-
-→ See `../02_System_Design/Data_Structures.md` §3.2 (ImageHeader)
+**Rationale over ECDSA P-256:**
+- Deterministic signing — no per-signature randomness needed; eliminates an entire class of implementation failures (ECDSA nonce reuse)
+- Fixed 64-byte signatures — no ASN.1 DER parsing, no variable-length handling
+- 256-bit public key vs. 512-bit for P-256 uncompressed
+- Simpler implementation — fewer opportunities for side-channel leakage
+- Faster verification
+- FIPS 186-5 includes Ed25519 (§7) — no compliance gap
 
 ---
 
@@ -65,9 +53,9 @@ The `ImageHeader.algorithm` field selects the verification algorithm. Devices mu
 
 **Usage:**
 - Firmware image integrity verification
-- Input to ECDSA signature verification (hash of image)
 - HMAC key in HKDF
 - Hash commitments (e.g., KR commitment)
+- Image header HMAC
 
 ### 3.2 Prohibited Algorithms
 
@@ -137,7 +125,6 @@ All cryptographic operations on the verification path MUST be constant-time:
 
 | Operation | Requirement | Measurement |
 | --- | --- | --- |
-| ECDSA P-256 verify | No data-dependent branches; fixed sequence of field ops | TIM-002 |
 | Ed25519 verify | Fixed-time implementation per RFC 8032 §5.1 | TIM-002 |
 | SHA-256 | Fixed-time for security-critical usage | TIM-001 |
 | Hash comparison | `constant_time_compare` — no early return | TIM-001 |
@@ -149,28 +136,24 @@ All cryptographic operations on the verification path MUST be constant-time:
 
 ## 7. Algorithm Rationale
 
-### 7.1 Why ECDSA P-256?
-
-- FIPS 186-5 compliant — required by some certification regimes
-- Widely reviewed, mature implementations available (mbedTLS, wolfSSL)
-- Hardware acceleration (CryptoCell, ARM TrustZone Crypto)
-
-### 7.2 Why Ed25519 (alternative)?
+### 7.1 Why Ed25519?
 
 - Simpler implementation — fewer opportunities for errors
 - Deterministic signing — no per-signature randomness needed
 - Faster verification (batched verification possible)
 - No need for ASN.1 DER encoding
-- Recommended by IETF (RFC 8032) and NIST (SP 800-186)
+- Fixed 64-byte signature — predictable storage
+- FIPS 186-5 compliant (included as Edwards-curve digital signature algorithm)
+- Recommended by IETF (RFC 8032), NIST (SP 800-186), and IANA
 
-### 7.3 Why SHA-256?
+### 7.2 Why SHA-256?
 
 - 128-bit collision resistance (no practical collisions known)
-- Required for ECDSA P-256 pairing
 - Hardware acceleration widely available
 - Smaller state and output than SHA-512 (important for embedded)
+- Required for all SBOP hashing operations
 
-### 7.4 Why HKDF?
+### 7.3 Why HKDF?
 
 - Standardized (RFC 5869), widely reviewed
 - Clean separation of extract and expand phases
@@ -189,4 +172,4 @@ All cryptographic operations on the verification path MUST be constant-time:
 | Side-Channel Countermeasures | `../../04_Security/Side_Channel_Countermeasures.md` |
 | Formal Verification | `../../04_Security/Formal_Verification.md` |
 | Data Structures (ImageHeader) | `../../02_System_Design/Data_Structures.md` |
-| Architecture Decision Record | `../../00_Architecture/Architecture_Decision_Record.md` (ADR-002, ADR-003) |
+| Architecture Decision Record | `../../00_Architecture/Architecture_Decision_Record.md` (ADR-002) |

@@ -275,7 +275,7 @@ Where:
 | --- | --- | --- | --- | --- |
 | A1.1.1 | High | **Mitigate** | Fault injection into verification is a practical attack | Redundant checks, state machine enforcement, → `Fault_Injection_Test.md (FI-001)` |
 | A1.1.2 | Medium | **Mitigate** | Parsing bugs are common in C/C++ | Fuzzing, input validation, → `Fuzzing_Strategy.md` |
-| A1.2.1 | Low | **Accept** | Breaking ECDSA/Ed25519 computationally infeasible | Use of standardized crypto, → `Crypto_Algorithms.md` |
+| A1.2.1 | Low | **Accept** | Breaking Ed25519 computationally infeasible | Use of standardized crypto, → `Crypto_Algorithms.md` |
 | A1.2.2 | Medium | **Mitigate** | Signing key is high-value target | HSM protection, key ceremony, → `Key_Management.md` |
 | A1.3.1 | High | **Mitigate** | MITM on firmware transfer is practical | Signature verification on device, TLS, → `OTA_Interface.md` |
 | A1.3.2 | Medium | **Mitigate** | Backend is trusted but must be hardened | Access control, audit logging, → `Key_Management.md` |

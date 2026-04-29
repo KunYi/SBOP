@@ -60,7 +60,7 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 | # | API | Signature | Category | Max Time | Ref |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `crypto_verify_signature` | `(&[u8], &[u8], u16, SigType, KeyRef) → Result<bool, CryptoError>` | F, T, SEC | 50 ms (P-256 @ 100 MHz) | §4.1 |
+| 1 | `crypto_verify_signature` | `(&[u8], &[u8], u16, SigType, KeyRef) → Result<bool, CryptoError>` | F, T, SEC | 20 ms (Ed25519) | §4.1 |
 | 2 | `crypto_compute_hash` | `(&[u8], HashAlgo) → Result<[u8; 32], CryptoError>` | F, T, SEC | 100 ms (1 MB @ 100 MHz) | §4.2 |
 | 3 | `crypto_constant_time_compare` | `(&[u8], &[u8], usize) → bool` | T, SEC | O(len) cycles, no early return | §4.3 |
 | 4 | `crypto_derive_key` | `(&[u8], &[u8], &[u8], u16) → Result<KeyMaterial, CryptoError>` | F, T, SEC | Constant-time wrt IKM | §4.4 |
@@ -158,7 +158,6 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 | Operation | Budget | Constant-Time | Measurement |
 | --- | --- | --- | --- |
 | Full boot (INIT → EXECUTE) | < 300 ms | — | End-to-end timing |
-| ECDSA P-256 verify | < 50 ms | Yes | TIM-001 |
 | Ed25519 verify | < 20 ms | Yes | TIM-001 |
 | SHA-256 (1 MB) | < 100 ms | Yes (fixed len) | TIM-002 |
 | Constant-time compare | O(len) cycles | Yes | TIM-002 |

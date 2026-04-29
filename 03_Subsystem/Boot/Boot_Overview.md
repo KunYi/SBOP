@@ -71,7 +71,7 @@ Defines the Boot subsystem responsible for enforcing the root of trust at device
 | 3 | SELECT_SLOT | Select highest-version valid slot (A or B) | Try other slot |
 | 4 | LOAD_IMAGE | Load image header from selected slot | Try other slot |
 | 5 | PARSE_HEADER | Parse ImageHeader struct, validate magic | FAILSAFE |
-| 6 | VERIFY_SIGNATURE | ECDSA P-256 / Ed25519 signature check | FAILSAFE |
+| 6 | VERIFY_SIGNATURE | Ed25519 signature check | FAILSAFE |
 | 7 | VERIFY_INTEGRITY | SHA-256 hash over image body | FAILSAFE |
 | 8 | CHECK_VERSION | Monotonic OTP counter comparison | FAILSAFE |
 | 9 | COMMIT_VERSION | Burn OTP counter (only if version > current) | Retry then FAILSAFE |

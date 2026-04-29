@@ -313,7 +313,7 @@ function ota_recover_from_interruption() -> Result<SlotStatus, OTAError>:
 | IDLE → AUTHENTICATE | update_available AND connectivity OK AND battery >= min_pct |
 | AUTHENTICATE → CHECK | auth_token valid AND auth_token not expired |
 | DOWNLOAD → VERIFY | downloaded_bytes == image_size AND SHA-256 matches |
-| VERIFY → INSTALL | ECDSA/Ed25519 signature valid |
+| VERIFY → INSTALL | Ed25519 signature valid |
 | INSTALL → ACTIVATE | slot write verified by read-back + hash check |
 | ACTIVATE → IDLE | Boot reports successful execution of new image |
 | ACTIVATE → ROLLBACK | Boot reports failure or fails to report within timeout |

@@ -17,7 +17,7 @@ State names aligned with `State_Machine.md`:
 | AUTHENTICATE | Mutual TLS with backend (KD_Auth client certificate) |
 | CHECK | Poll backend for available firmware update |
 | DOWNLOAD | Receive firmware image via TLS 1.3 |
-| VERIFY | Device-side signature (ECDSA P-256/Ed25519) + SHA-256 hash verification |
+| VERIFY | Device-side signature (Ed25519) + SHA-256 hash verification |
 | STAGE | Write verified image to inactive slot |
 | ACTIVATE | Request boot activation; boot verifies and executes |
 | ROLLBACK | Revert to previous valid image on boot failure |
@@ -97,7 +97,7 @@ Error: → ERROR (after max retries)
 ### VERIFY
 
 - Device independently re-verifies firmware (backend may be compromised):
-  - Signature verification: ECDSA P-256 or Ed25519 against KI public key
+  - Signature verification: Ed25519 against KI public key
   - SHA-256 hash over image body, constant-time comparison
 - Backend authentication is NOT sufficient — device always re-verifies
 

@@ -83,9 +83,9 @@ This document maps every attack vector from the SBOP attack tree (→ `Attack_Tr
 
 | Attack | Mitigation | Requirement | Design | Test |
 | --- | --- | --- | --- | --- |
-| A8.1.1 Timing oracle on signature verify | Constant-time ECDSA/Ed25519 verification | REQ-SR-SCH-001 | Side_Channel_Countermeasures §3 | TIM-002 |
+| A8.1.1 Timing oracle on signature verify | Constant-time Ed25519 verification | REQ-SR-SCH-001 | Side_Channel_Countermeasures §3 | TIM-002 |
 | A8.1.2 Timing oracle on hash compare | `constant_time_compare` — no early return | REQ-SR-SCH-001 | Side_Channel_Countermeasures §3.2 | TIM-001 |
-| A8.2.1 SPA on ECDSA verification | Fixed-sequence operations, balanced point ops | SCH-SPA-001 through SCH-SPA-003 | Side_Channel_Countermeasures §4.1 | TVLA (FvR) |
+| A8.2.1 SPA on Ed25519 verification | Fixed-sequence operations, balanced point ops | SCH-SPA-001 through SCH-SPA-003 | Side_Channel_Countermeasures §4.1 | TVLA (FvR) |
 | A8.2.2 DPA on key derivation | Masking, blinding (SL 3+) | SCH-DPA-001, SCH-DPA-002 | Side_Channel_Countermeasures §4.2 | TVLA (FvR) |
 | A8.3.1 EM leakage from crypto operations | EM shielding (PCB/package level), balanced routing, low-emission logic styles | REQ-SR-SCH-001 | Side_Channel_Countermeasures §5 | EM emanation test (SL 3+) |
 

@@ -28,7 +28,6 @@ Mandatory constraints:
   - No data-dependent loop bounds
   - No data-dependent memory access patterns
   - No data-dependent branch conditions on secret data
-  - ECDSA: scalar multiplication must use fixed-window or Montgomery ladder
   - Ed25519: verify per RFC 8032 §5.1 (fixed-time formula)
 
 Prohibited:

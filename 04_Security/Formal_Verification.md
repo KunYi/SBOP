@@ -185,8 +185,8 @@ Once tamper is detected, the device remains locked permanently.
 **Tool:** Coq, Isabelle/HOL, or F*
 
 **Approach:**
-1. Formally specify ECDSA P-256 verification algorithm in proof assistant
-2. Prove that `verify_signature(msg, sig, pk) = true ⇔ sig = Sign(sk, msg)`
+1. Formally specify Ed25519 verification algorithm in proof assistant
+2. Prove that `verify_signature(msg, sig, pk) = true ⇔ sig = Sign(sk, msg)` per RFC 8032
 3. Prove that `verify_signature` is constant-time (no data-dependent branches)
 4. Extract verified C code via Coq's extraction or F*'s Low* to C
 
@@ -215,7 +215,7 @@ Once tamper is detected, the device remains locked permanently.
 | Function | Tool | Property |
 | --- | --- | --- |
 | `constant_time_compare(a, b, len)` | ct-verif | No early return; no secret-dependent branch |
-| `verify_ecdsa(msg, sig, pk)` | SideTrail | No key-dependent execution time |
+| `verify_ed25519(msg, sig, pk)` | SideTrail | No key-dependent execution time |
 | `sha256_verify(msg, expected_hash)` | ct-verif | Compare step is constant-time |
 | `check_version(new, current)` | Manual review + timing measurement | Fixed-sequence comparison |
 
@@ -356,7 +356,7 @@ For each counterexample found by the model checker:
 | ASM-01 | TRNG output is unpredictable with sufficient entropy | Per NIST SP 800-90B health tests |
 | ASM-02 | OTP cells are truly write-once | Hardware specification; verified by fuse readback |
 | ASM-03 | HSM prevents key extraction | FIPS 140-2 Level 3 certification |
-| ASM-04 | ECDSA P-256 / Ed25519 provide existential unforgeability | Cryptographic assumption; reviewed algorithms |
+| ASM-04 | Ed25519 provide existential unforgeability | Cryptographic assumption; reviewed algorithms |
 | ASM-05 | SHA-256 is collision-resistant | Cryptographic assumption |
 | ASM-06 | MPU/MMU correctly enforces access permissions | Hardware specification; verified by access tests |
 

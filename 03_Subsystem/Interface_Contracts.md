@@ -202,7 +202,7 @@ crypto_verify_signature(
             - Whether signature is valid or invalid
             - Data content
             - Key value
-        Max time: 50 ms for P-256 verify at 100 MHz
+        Max time: 20 ms for Ed25519 verify at 400 MHz
 
     Side effects:
         none

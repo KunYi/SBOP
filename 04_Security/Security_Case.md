@@ -37,7 +37,7 @@ This document serves as the single entry point for all security-related artifact
 ### C1: Firmware Authenticity
 **Claim:** Only authenticated firmware can execute on the device.
 **Attack tree nodes:** A1 (Execute Unauthorized Firmware — covers signature forgery A1.1, key compromise A1.2.2, OTA injection A1.3)
-**Enforced by:** ECDSA P-256 / Ed25519 signature verification in bootloader, KI public key in Zone 1 read-only
+**Enforced by:** Ed25519 signature verification in bootloader, KI public key in Zone 1 read-only
 **Evidence:** TEST-BOOT-002, FI-001
 
 ### C2: Firmware Integrity

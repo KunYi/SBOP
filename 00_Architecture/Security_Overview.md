@@ -11,7 +11,7 @@
 
 | Objective | Goal | Key Mechanism |
 | --- | --- | --- |
-| Firmware authenticity | G-AUTH | ECDSA P-256 / Ed25519 signature verification |
+| Firmware authenticity | G-AUTH | Ed25519 signature verification |
 | Firmware integrity | G-INT | SHA-256 hash verification, constant-time compare |
 | Anti-rollback | (subset of G-AUTH) | Monotonic OTP version counter |
 | Device identity | G-CLONE | TRNG UID + HKDF-derived KD, backend dedup |

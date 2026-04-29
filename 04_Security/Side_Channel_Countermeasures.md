@@ -38,7 +38,7 @@ This document defines the architectural requirements for side-channel attack res
 
 | Operation | Side-Channel Sensitivity | Rationale |
 | --- | --- | --- |
-| ECDSA signature verification | **High** | Public key operations can leak key information via timing |
+| Ed25519 signature verification | **High** | Public key operations can leak key information via timing |
 | SHA-256 hash computation | **Medium** | Hash is public; but data-dependent timing can leak firmware content |
 | Key derivation (HKDF) | **High** | Key material is processed; leaks could expose derived keys |
 | Constant-value comparison | **High** | memcmp timing creates an oracle for byte-by-byte attacks |
@@ -95,7 +95,7 @@ function constant_time_compare(a: &[u8], b: &[u8], len: usize) -> bool:
 | --- | --- |
 | SCH-SPA-001 | Crypto operations must use fixed instruction sequence (no data-dependent branches) |
 | SCH-SPA-002 | Key-dependent operations must not create distinguishable power signatures |
-| SCH-SPA-003 | Public-key operations (ECDSA verify) should use balanced point addition/doubling |
+| SCH-SPA-003 | Public-key operations (Ed25519 verify) should use balanced point addition/doubling |
 
 ### 4.2 DPA Countermeasures
 

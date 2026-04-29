@@ -24,7 +24,7 @@ Defines all valid system states and transitions, aligned with the 12-phase boot 
 | SELECT_SLOT | Choose highest-version valid slot (A or B) |
 | LOAD_IMAGE | Load image header from selected slot |
 | PARSE_HEADER | Parse and validate ImageHeader struct |
-| VERIFY_SIGNATURE | ECDSA P-256 / Ed25519 signature check |
+| VERIFY_SIGNATURE | Ed25519 signature check |
 | VERIFY_INTEGRITY | SHA-256 hash over image body |
 | CHECK_VERSION | Compare version against OTP counter |
 | COMMIT_VERSION | Burn OTP counter if version > current |

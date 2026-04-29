@@ -172,7 +172,7 @@ Defines the threat actors, their capabilities, motivations, and attack goals rel
 
 | ID | Assumption | Rationale |
 | --- | --- | --- |
-| ASM-DEF-01 | Attacker cannot break ECDSA P-256 / Ed25519 | Cryptographic assumption |
+| ASM-DEF-01 | Attacker cannot break Ed25519 | Cryptographic assumption |
 | ASM-DEF-02 | Attacker cannot find SHA-256 collisions | Cryptographic assumption |
 | ASM-DEF-03 | Attacker cannot forge TRNG output | Hardware entropy assumption |
 | ASM-DEF-04 | FIPS 140-2 L3 HSM prevents key extraction | HSM certification |

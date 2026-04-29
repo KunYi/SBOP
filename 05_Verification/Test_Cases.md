@@ -345,7 +345,7 @@ Same as TEST-OTA-001 but backend serves firmware with bit-flipped payload.
 **Priority:** P0
 
 **Test Vectors:**
-- Valid ECDSA P-256 signatures (NIST test vectors)
+- Valid Ed25519 signatures (RFC 8032 test vectors)
 - Valid Ed25519 signatures (RFC 8032 test vectors)
 - Invalid signatures: wrong r, wrong s, r=0, s=0, r=n, s=n
 - Truncated signatures

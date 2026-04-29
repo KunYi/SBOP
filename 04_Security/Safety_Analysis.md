@@ -45,7 +45,7 @@ If SBOP's security controls fail, the executing firmware is untrusted. Any safet
 | --- | --- |
 | Hazard | Execution of firmware that has not passed cryptographic verification |
 | Potential harm | Uncontrolled system behavior leading to physical harm, mission loss, data breach |
-| Safety barrier | SBOP secure boot with ECDSA/Ed25519 signature verification + SHA-256 integrity |
+| Safety barrier | SBOP secure boot with Ed25519 signature verification + SHA-256 integrity |
 | Security barrier | HSM-backed signing, key hierarchy (KR→KD→KI), anti-rollback |
 
 ### 3.2 Hazard Causal Factors
@@ -195,7 +195,7 @@ For SIL 3 via Route 1S (proven in use):
 
 | Element | Evidence Required | Status |
 | --- | --- | --- |
-| ECDSA P-256 verification | Widespread deployment, no known breaks | Accepted primitive |
+| Ed25519 verification | Widespread deployment, no known breaks | Accepted primitive |
 | SHA-256 | Widespread deployment, no practical collisions | Accepted primitive |
 | Dual-image boot model | Deployed in safety-critical systems (e.g., UEFI Secure Boot in automotive ECUs) | Partial — requires platform-specific evidence |
 | Constant-time implementation | Requires per-platform timing measurement | TBD during implementation |
@@ -272,7 +272,7 @@ Medical device manufacturers must assess whether the residual risk of SBOP secur
 ```
 G1: SBOP ensures only authentic firmware executes
 ├── G1.1: Signature verification is correct
-│   ├── Sn1.1.1: ECDSA/Ed25519 algorithms are mathematically sound
+│   ├── Sn1.1.1: Ed25519 algorithms are mathematically sound
 │   ├── Sn1.1.2: Implementation is constant-time (TIM-001, TIM-002 evidence)
 │   └── Sn1.1.3: Verification state machine has no bypass paths (formal verification)
 ├── G1.2: Integrity verification is correct

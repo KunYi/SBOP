@@ -13,7 +13,7 @@
 **Status:** Approved
 
 **Description:**
-The system shall verify the authenticity of the firmware image before execution using cryptographic signature verification (ECDSA P-256 or Ed25519).
+The system shall verify the authenticity of the firmware image before execution using cryptographic signature verification (Ed25519).
 
 **Rationale:**
 Prevents execution of unauthorized firmware. This is the single most critical security requirement — bypass enables all other attacks.

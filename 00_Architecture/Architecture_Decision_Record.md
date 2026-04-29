@@ -51,34 +51,35 @@ Use a dual-image A/B slot model where:
 
 ---
 
-### ADR-002: Dual Algorithm Support (ECDSA P-256 + Ed25519)
+### ADR-002: Single Signature Algorithm (Ed25519)
 
 **Status:** Accepted
 **Date:** 2026-04-28
+**Revised:** 2026-04-29 — simplified to Ed25519-only
 **Stakeholders:** Security Architecture, Crypto Team
 
 **Context:**
-Firmware signature verification is the single most critical security operation. Algorithm choice affects security level, code size, verification speed, and standards compliance. Different deployment domains have different algorithm preferences (e.g., Ed25519 preferred in modern systems, ECDSA P-256 required by some certification regimes).
+Firmware signature verification is the single most critical security operation. Algorithm choice affects security level, code size, verification speed, and standards compliance.
 
 **Decision:**
-Support both ECDSA P-256 and Ed25519 for firmware signing and verification. The image header includes an algorithm identifier field. At least one must be implemented; both are recommended.
+Use Ed25519 as the single required firmware signature algorithm. ECDSA P-256 is removed to eliminate redundant algorithms with similar security properties. Ed25519 is FIPS 186-5 compliant, simpler to implement correctly, and more resistant to side-channel attacks than ECDSA.
 
 **Alternatives considered:**
 
 | Alternative | Rejected Because |
 | --- | --- |
-| ECDSA P-256 only | Ed25519 is simpler, faster, and more resistant to implementation errors |
-| Ed25519 only | Some standards bodies still require NIST curves (FIPS 186-5) |
+| ECDSA P-256 only | More complex (ASN.1 DER, variable-length signatures), nonce-reuse risk, slower verification |
+| Dual algorithm (Ed25519 + ECDSA P-256) | Redundant — same 128-bit security level; doubled code size, attack surface, and certification burden |
 | RSA-2048 | Signature size too large for embedded storage; slower verification |
 | Custom crypto | Prohibited by security policy |
 
 **Consequences:**
-- Increased code size (~8 KB for second algorithm)
-- Both algorithms must pass TVLA testing
-- Image header must carry algorithm identifier
-- Signing infrastructure must support both
+- Single algorithm to implement, test, and certify
+- Smaller code size (~4 KB vs ~12 KB for dual)
+- FIPS 186-5 compliance via Ed25519 (§7, Edwards-curve digital signature)
+- SignatureBlock.algorithm must be 0x02 (Ed25519)
 
-**References:** `Crypto_Algorithms.md`, `Image_Format.md`, `Data_Structures.md` §3.2
+**References:** `Crypto_Algorithms.md`, `Signature_Format.md`, `Data_Structures.md` §4
 
 ---
 

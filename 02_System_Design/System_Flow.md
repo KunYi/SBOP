@@ -24,7 +24,7 @@ Aligned with `Boot_Flow_Pseudocode.md`:
 | 3 | SELECT_SLOT | Select highest-version valid slot (A/B) | Slot metadata valid |
 | 4 | LOAD_IMAGE | Load image header from selected slot | Magic number |
 | 5 | PARSE_HEADER | Parse ImageHeader struct, validate fields | Header integrity |
-| 6 | VERIFY_SIGNATURE | ECDSA P-256 / Ed25519 signature check | Signature valid |
+| 6 | VERIFY_SIGNATURE | Ed25519 signature check | Signature valid |
 | 7 | VERIFY_INTEGRITY | SHA-256 hash over image body, constant-time compare | Hash matches |
 | 8 | CHECK_VERSION | Compare image version against OTP counter | Version >= OTP |
 | 9 | COMMIT_VERSION | Burn OTP counter (only if version > current) | OTP write success |
