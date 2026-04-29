@@ -1964,122 +1964,140 @@ Transition from legacy to multi-key:
 
 ---
 
-#### 3.11.1 Two-Copy Atomic Metadata Journal
+#### 3.11.1 Tiered Metadata Journal (Critical + Frequent)
 
-**Problem:** Single metadata sector + CRC-32 is vulnerable to power loss during write. If power fails between `storage_set_slot_status(VERIFIED)` and `CRC write`, the CRC is stale — bootloader reads corrupt slot state on next reset and may misidentify the active slot.
+**Problem:** A single metadata journal mixing critical slot state (updated only during OTA) with per-boot fields (boot attempt count, prev_boot_phase, IV hash) causes unnecessary write amplification. Every boot must erase a 4 KB sector and rewrite the entire journal just to update a 1-byte counter. This wastes NOR endurance (~100K cycles/sector) on fields that could be append-only. Worse, power loss during a per-boot counter update can corrupt the critical slot state that was written alongside it in the same sector.
 
-**Design:** Two metadata copies (A and B) in **separate 4 KB NOR sectors**, each with a monotonic sequence number. The copy with the higher valid sequence number is authoritative. Using separate sectors ensures a single sector erase failure or power loss during write cannot corrupt both copies.
+**Design:** Split metadata into two independent journals with different update frequencies and write protocols:
+
+| Journal | Location | Sectors | Update Trigger | Write Protocol | Record Size |
+|---------|----------|---------|----------------|----------------|-------------|
+| **Critical** | 0x20_0000 + 0x20_1000 | 2× 4 KB | OTA / slot transition only | Two-copy atomic (erase + write + verify + commit) | 128 B |
+| **Frequent** | 0x20_2000 | 1× 4 KB | Every successful boot | Ring buffer append (no erase until wrap) | 32 B |
+
+This eliminates ~95% of metadata sector erases. A device updated weekly with daily reboots erases its critical sectors ~52 times/year instead of ~365 times/year. The frequent journal sector handles ~128 records before one erase — at one boot/day, that's one erase every ~4 months.
+
+**Critical Journal (two-copy atomic, NOR 0x20_0000 + 0x20_1000):**
+
+Contains ONLY fields that change during OTA or slot state transitions. Never written during a normal boot. Written when: OTA writes a new image, slot status changes, boot_set_confirmed() promotes TESTING→ACTIVE, slot fallback occurs.
 
 ```
-Metadata layout (NOR, two 4 KB sectors):
-
-Copy A: 0x20_0000 (4 KB sector)            Copy B: 0x20_1000 (4 KB sector)
+Copy A (0x20_0000, 4 KB sector):            Copy B (0x20_1000, 4 KB sector):
 ┌────────────────────────────┐              ┌────────────────────────────┐
-│ [0]  sequence   : u32      │              │ [0]  sequence   : u32      │
-│ [4]  active_slot: u8       │              │ [4]  active_slot: u8       │
-│ [5]  boot_target: u8       │              │ [5]  boot_target: u8       │
-│ [6]  re_encrypt_state: u8  │              │ [6]  re_encrypt_state: u8  │
-│ [7]  reserved   : u8       │              │ [7]  reserved   : u8       │
-│ [8]  slot_a_info: ImageInfo│              │ [8]  slot_a_info: ImageInfo│
-│ [60] slot_b_info: ImageInfo│              │ [60] slot_b_info: ImageInfo│
-│ ...                         │              │ ...                         │
-│ [252] crc32     : u32      │              │ [252] crc32     : u32      │
+│ [0]   sequence       : u32 │              │ [0]   sequence       : u32 │
+│ [4]   active_slot    : u8  │              │ [4]   active_slot    : u8  │
+│ [5]   boot_target    : u8  │              │ [5]   boot_target    : u8  │
+│ [6]   re_encrypt_state:u8  │              │ [6]   re_encrypt_state:u8  │
+│ [7]   reserved       : u8  │              │ [7]   reserved       : u8  │
+│ [8]   slot_a_info    : 52 B│              │ [8]   slot_a_info    : 52 B│
+│ [60]  slot_b_info    : 52 B│              │ [60]  slot_b_info    : 52 B│
+│ [112] max_allowed_ver: u32 │              │ [112] max_allowed_ver: u32 │
+│ [116] reserved2      : u8[8]│             │ [116] reserved2      : u8[8]│
+│ [124] crc32          : u32 │              │ [124] crc32          : u32 │
 └────────────────────────────┘              └────────────────────────────┘
-  512 bytes total                             512 bytes total
+  128 bytes total                             128 bytes total
   Rest of 4 KB sector unused                  Rest of 4 KB sector unused
 ```
 
-**re_encrypt_state values:**
-
-| Value | Name | Meaning |
-|-------|------|---------|
-| 0x00 | RE_STATE_IDLE | No re-encrypt in progress |
-| 0x01 | RE_STATE_STAGED | KD-encrypted data written to staging area, ready to commit |
-| 0x02 | RE_STATE_COMMITTED | Staging data committed, old area pending erase |
-
-**IV reuse detection field:**
+**Critical journal write protocol** — same two-copy atomic sequence as before, but now only 128 bytes (vs 256), and only triggered on OTA/slot events:
 
 ```
-[252] last_iv_hash : u8[32]   // SHA-256(IV_dev || KD[0..16]) of last successful boot
-                                // Checked at boot to detect AES-CTR keystream replay.
-                                // Updated after successful Phase 6 integrity verification.
-```
-
-**Updated metadata layout:**
-
-```
-[0]   sequence         : u32      (4 B)
-[4]   active_slot      : u8       (1 B)
-[5]   boot_target      : u8       (1 B)
-[6]   re_encrypt_state : u8       (1 B)
-[7]   reserved         : u8       (1 B)
-[8]   slot_a_info      : ImageInfo (52 B)
-[60]  slot_b_info      : ImageInfo (52 B)
-[112] boot_attempt_count : u8     (1 B)
-[113] prev_boot_phase  : u8       (1 B)
-[114] max_allowed_version : u32   (4 B)  // Anti-rollback ceiling
-[118] reserved2        : u8[102]  (102 B)
-[220] last_iv_hash     : u8[32]   (32 B) // IV reuse detection
-[252] crc32            : u32      (4 B)
-Total: 256 bytes
-```
-
-**Write protocol (atomic via sequence numbers):**
-
-```
-function metadata_write(new_data):
-    // 1. Find current active copy (higher valid sequence)
-    let (active_idx, inactive_idx, current_seq) = metadata_find_active()
-
-    // 2. Prepare new copy with in-progress sequence (odd)
-    new_seq = current_seq + 1  // odd = writing, even = committed
+function critical_journal_write(new_data):
+    let (active_idx, inactive_idx, current_seq) = critical_journal_find_active()
+    new_seq = current_seq + 1  // odd = writing
     new_data[0..4] = new_seq
-    new_data[252..256] = crc32(new_data[0..252])
-
-    // 3. Write to inactive copy (separate 4 KB sector — safe to erase)
-    nor_spi_erase_sector(inactive_sector_base)
-    nor_spi_page_program(inactive_sector_base, new_data, 256)
-
-    // 4. Read-back and verify CRC
-    verify_data = nor_spi_read(inactive_sector_base, 256)
-    assert(crc32(verify_data[0..252]) == verify_data[252..256])
-
-    // 5. Commit: increment sequence to even
+    new_data[124..128] = crc32(new_data[0..124])
+    nor_spi_erase_sector(inactive_sector_base)        // Separate 4 KB sector
+    nor_spi_page_program(inactive_sector_base, new_data, 128)
+    verify_data = nor_spi_read(inactive_sector_base, 128)
+    assert(crc32(verify_data[0..124]) == verify_data[124..128])
     new_seq = current_seq + 2  // even = committed
-    nor_spi_write_u32(inactive_sector_base, new_seq)  // Atomic 4-byte write
-
-    // 6. Old copy is now stale — will be used as inactive next time
+    nor_spi_write_u32(inactive_sector_base, new_seq)  // Atomic 4-byte commit
 ```
 
-**Read protocol (at boot):**
+**Frequent Journal (ring buffer, NOR 0x20_2000, 4 KB sector):**
+
+Records per-boot information. Simple append-only ring buffer — no sector erase needed until the ring wraps (~128 records). A CRC-8 on each record detects partial writes from power loss. Scanning backward from the end of the sector finds the most recent valid record.
 
 ```
-function metadata_read() -> Metadata:
-    seq_a = nor_spi_read_u32(0x20_0000)
-    seq_b = nor_spi_read_u32(0x20_1000)
-    crc_a_ok = crc32_check(copy_a)
-    crc_b_ok = crc32_check(copy_b)
-
-    if crc_a_ok && crc_b_ok:
-        if seq_a >= seq_b:
-            active_was_written_last = (seq_a & 1) == 0  // even = committed
-        else:
-            active_was_written_last = (seq_b & 1) == 0
-        if !active_was_written_last:
-            // Odd sequence = power loss during write
-            // Use the OTHER copy (previous committed state), discard partial
-            return (seq_a > seq_b) ? copy_b : copy_a
-
-    if crc_a_ok:
-        return copy_a  // Only A survived (Copy B sector lost)
-    if crc_b_ok:
-        return copy_b  // Only B survived (Copy A sector lost)
-
-    // Neither valid — metadata area destroyed
-    boot_enter_failsafe(ERR-STOR-READ-001)
+Frequent record (32 bytes each):
+┌────────────────────────────┐
+│ [0]  boot_seq        : u32 │  Monotonic boot counter (1, 2, 3, ...)
+│ [4]  prev_boot_phase : u8  │  0x00 = did not reach EXECUTE
+│     .                        │  0x01 = reached EXECUTE (normal boot)
+│     .                        │  0x02 = confirmed (app called boot_set_confirmed)
+│ [5]  flags           : u8  │  bit 0: was_testing on this boot
+│     .                        │  bit 1: was_fallback slot
+│     .                        │  bits 2-7: reserved
+│ [6]  reserved         : u8[2]│
+│ [8]  last_iv_hash     : u8[24]│ Truncated SHA-256(IV_dev || KD[0..16])
+│ [32] (end)                   │
+└────────────────────────────┘
 ```
 
-**Cost:** Two 4 KB sectors (8 KB total), +~300 bytes code. Separate sectors prevent a single sector erase failure from destroying both copies. Power loss during erase of Copy B's sector leaves Copy A intact, and vice versa.
+**Frequent journal operations:**
+
+```
+function frequent_journal_append(phase, flags, iv_hash):
+    let last = frequent_journal_read_last()
+    let new_seq = (last.valid) ? last.boot_seq + 1 : 1
+    let write_off = frequent_journal_find_next_free()
+    if write_off >= 4096 - 32:
+        nor_spi_erase_sector(0x20_2000)   // Ring wrapped — erase and restart
+        write_off = 0
+    let record = pack(new_seq, phase, flags, iv_hash[0..24])
+    nor_spi_page_program(0x20_2000 + write_off, record, 32)
+    let verify = nor_spi_read(0x20_2000 + write_off, 32)
+    assert(memcmp(record, verify, 32) == 0)
+
+function frequent_journal_read_last() -> Option<FrequentRecord>:
+    // Scan backward from end for first non-erased record with valid CRC-8
+    for off in (4096 - 32) down to 0 step 32:
+        data = nor_spi_read(0x20_2000 + off, 32)
+        if data[0..4] != 0xFFFFFFFF:          // Not erased
+            if crc8(data[0..31]) == data[31]: // CRC-8 check
+                return Some(parse(data))
+    return None  // Sector empty (all 0xFF) or all records corrupt
+
+function frequent_journal_find_next_free() -> u32:
+    for off in 0..4096 step 32:
+        data = nor_spi_read(0x20_2000 + off, 4)
+        if data[0..4] == 0xFFFFFFFF:
+            return off
+    return 4096  // Sector full
+```
+
+**Power-loss analysis for frequent journal:**
+
+| Failure Point | What Happens | Impact |
+|---------------|-------------|--------|
+| Power loss during page program | Record has partial data, CRC-8 mismatch | `read_last()` skips it, finds previous record. One boot record lost — harmless. |
+| Power loss during sector erase | All records lost | boot_seq resets to 1, IV reuse check is best-effort (no history to compare = no false positive) |
+| Power loss between append and verify | Record may be corrupt | Same as partial write — skipped by CRC check |
+
+In all cases, **critical slot state is never at risk** — the frequent journal is a separate sector, and the critical journal is not touched during normal boots.
+
+**IV reuse detection with frequent journal:**
+
+```
+// Phase 6 (VERIFY_INTEGRITY): check IV reuse
+let last = frequent_journal_read_last()
+if last.valid:
+    let expected_hash = sha256(current_iv || KD[0..16])
+    if last.last_iv_hash == expected_hash[0..24]:
+        // Same (KD, IV) pair used twice — possible AES-CTR keystream replay
+        boot_enter_failsafe(ERR-BOOT-CRYPTO-007)
+
+// Phase 11 (EXECUTE): record this boot's IV hash for next boot's check
+let new_iv_hash = sha256(current_iv || KD[0..16])
+frequent_journal_append(0x01, flags, new_iv_hash)
+```
+
+**Why last_iv_hash is truncated to 24 bytes:** The field must fit in a 32-byte record alongside boot_seq, phase, and flags. A 24-byte truncated hash retains 192 bits of collision resistance — an attacker would need ~2^96 attempts to find an IV that produces the same truncated hash, well beyond brute-force feasibility. The full SHA-256 is still computed; only the stored fingerprint is truncated.
+
+**Migration from single journal:** At first boot after this change, the bootloader detects the old 256-byte journal format (CRC at offset 252 vs 124). It reads the old format once, writes both new journals (critical from old slot/version fields, frequent from old boot_attempt/prev_boot_phase/IV fields), then never reads the old format again. The old sectors are left intact for rollback compatibility.
+
+**Cost:** Three 4 KB sectors (12 KB total, +4 KB vs prior), +~450 bytes code. Critical journal rarely erased (OTA events only). Frequent journal erased once per ~128 boots. Eliminates ~95% of metadata NOR erases vs single journal.
 
 ---
 
@@ -2124,88 +2142,112 @@ nor_spi_write_status_register(BP2_BIT | SRP1_ENABLE);  // Re-lock
 
 ---
 
-#### 3.11.3 Boot Health Reporting with N-Attempt Policy
+#### 3.11.3 Test/Confirm Model (MCUboot-Style Immediate Rollback)
 
-**Problem:** The bootloader currently detects boot failure (hardfault, watchdog, signature fail) and immediately rolls back to the fallback slot. But a one-time transient fault — EMI burst, brief power dip, single-event upset — triggers an unnecessary rollback that permanently demotes a valid image.
+**Problem:** The N-attempt policy tolerates up to N consecutive failures before rollback. Each failed boot means the device is unavailable for ~300 ms (full verification + app init → crash → reset). For a device that reboots every 30 seconds, 3 attempts = 90 seconds of unavailability. Worse, a crashing application that manages to call the health API before crashing can reset the counter and prevent rollback indefinitely.
 
-**Design:** The application reports a "boot health" status within a configurable window. The bootloader only rolls back after N consecutive failures without a health report.
+**Design:** Adopt MCUboot's test/confirm model: after a successful update, the new image enters **TESTING** state, not ACTIVE. The application must call `boot_set_confirmed()` to promote itself to ACTIVE. If the device resets for ANY reason before confirmation, the bootloader **immediately** reverts to the fallback slot — no retry count, no N-attempt accumulation.
 
-**Key insight — counter is only incremented when the previous boot reached EXECUTE:** If power fails during verification (before the jump), the image is still cryptographically valid and the counter is NOT incremented. This prevents false rollback from rapid power cycling. The counter only increments when the app was given control (EXECUTE jump issued) but failed to report health.
-
-```
-Metadata fields (2 bytes in metadata journal):
-  boot_attempt_count : u8   // Number of consecutive boots that reached EXECUTE
-                             // without health report. 0 = healthy.
-                             // 1-N = failures since last health report.
-                             // N+1 = trigger rollback.
-  prev_boot_phase    : u8   // Phase reached in previous boot
-                             // 0x00 = unknown / did not reach EXECUTE
-                             // 0x01 = reached EXECUTE (jump issued)
-```
-
-**Bootloader logic (CHECK_VERSION phase, after signature + hash pass):**
+This is strictly better than N-attempt for three reasons:
+1. **Faster recovery:** One failed boot triggers rollback, not N failed boots.
+2. **No counter management:** The application doesn't need to track or clear attempt counts — a single API call confirms health.
+3. **Matches industry practice:** MCUboot, Android A/B updates, and ChromeOS all use this model.
 
 ```
-function boot_check_health(slot):
-    prev_phase = metadata_read_prev_boot_phase()
-    boot_attempt_count = metadata_read_boot_attempt_count()
+Slot state machine (test/confirm extension):
 
-    if prev_phase == 0x01:
-        // Previous boot reached EXECUTE — app had a chance to run
-        if boot_attempt_count == 0:
-            // App reported health — all good, proceed
-            pass
+  PENDING ──(verify OK, first boot)──> TESTING
+  TESTING ──(app calls boot_set_confirmed())──> ACTIVE
+  TESTING ──(reset without confirm)──> INVALID  // Immediate rollback
+  ACTIVE ──(new OTA to other slot)──> FALLBACK
+```
+
+**Bootloader logic (SELECT_SLOT phase):**
+
+```
+function boot_select_slot():
+    let boot_slot = metadata_read_boot_target()
+    let slot_status = storage_get_slot_status(boot_slot)
+
+    if slot_status == TESTING:
+        // Application never confirmed — image is unhealthy.
+        // Immediate rollback. No retry.
+        error_log_write(SELECT_SLOT, ERR-BOOT-STATE-005)
+        storage_set_slot_status(boot_slot, INVALID)
+        let fallback = (boot_slot == SLOT_A) ? SLOT_B : SLOT_A
+        let fb_status = storage_get_slot_status(fallback)
+        if fb_status == ACTIVE or fb_status == FALLBACK:
+            metadata_set_boot_target(fallback)
+            system_reset()  // Restart with fallback slot
         else:
-            // App did NOT report health — this is a real failure
-            boot_attempt_count += 1
-            if boot_attempt_count >= MAX_BOOT_ATTEMPTS:    // Default: 3
-                // Too many failed attempts — roll back
-                storage_set_slot_status(slot, INVALID)
-                metadata_set_boot_attempt_count(0)
-                metadata_set_prev_boot_phase(0x00)
-                fallback_slot = storage_get_fallback_slot()
-                boot_set_pending_image(fallback_slot)
-                system_reset()
-            metadata_set_boot_attempt_count(boot_attempt_count)
-    else:
-        // Previous boot did NOT reach EXECUTE — image never got a chance to run
-        // Power loss during verification, transient reset, etc.
-        // Do NOT increment counter — image is cryptographically valid
-        // Reset counter to 1 (this boot is the first real attempt)
-        metadata_set_boot_attempt_count(1)
+            boot_enter_failsafe(ERR-BOOT-STATE-004)  // No bootable slot
 
-    proceed_to_execute()
-
-// ── Phase 11 (EXECUTE), just before jump: ──
-    metadata_set_prev_boot_phase(0x01)     // Mark: we issued the jump
-    // boot_attempt_count stays at whatever was set above (1 or incremented)
-
-    // Two-pass boot: IWDG cannot be software-disabled. Use RTC magic + system reset
-    // so Pass 2 jumps to the application with IWDG stopped (see §3.13).
-    RTC->BKP0R = IWDG_RESET_MAGIC   // 0x49574447
-    NVIC_SystemReset()              // System reset → IWDG stops → Pass 2 → jump to app
-
-Application (Zone 2, early init):
-    if metadata_read_boot_attempt_count() > 0:
-        // We're alive! Clear the counter — boot was healthy
-        metadata_set_boot_attempt_count(0)
-        metadata_increment_boot_count()      // Increment total successful boots
+    // ... continue to boot_verify_and_execute_slot(boot_slot) ...
 ```
 
-**Failure scenarios and recovery:**
+**Application confirm API:**
 
-| Scenario | prev_phase | attempt_count (before) | Action |
-|---|---|---|---|
-| Normal boot, app reports health | 0x01 | 0 (cleared by app) | None — proceed |
-| Power loss during verification (before EXECUTE) | 0x00 | any | Reset to 1, retry same slot — image still valid |
-| Transient fault, app gets control but hardfaults | 0x01 | 1 | Increment to 2; retry same slot |
-| Transient fault, second hardfault | 0x01 | 2 | Increment to 3; retry same slot |
-| Transient fault, third hardfault | 0x01 | 3 | Rollback to fallback (MAX=3) |
-| Persistent corruption (never reaches EXECUTE) | 0x00 each boot | reset to 1 each boot | Retries indefinitely, then slot fallback (§3.12) |
-| Rapid power cycling (user flipping switch) | 0x00 each cycle | reset to 1 each cycle | No false rollback — prev_phase never set to 0x01 |
-| App boots but doesn't call health API | 0x01 | 1→2→3→rollback | Caught after N boots |
+```
+/// Called by the application after self-test, sensor check, and network
+/// connectivity are confirmed. Typically in early init, before the main loop.
+function boot_set_confirmed() -> Result<(), BootError>:
+    let active_slot = metadata_read_active_slot()
+    let slot_status  = storage_get_slot_status(active_slot)
 
-**Cost:** +2 bytes in metadata journal (prev_boot_phase + existing attempt_count), +~200 bytes code (phase tracking logic). Prevents unnecessary rollback on transient faults and power cycling.
+    if slot_status != TESTING:
+        return Err(ERR-BOOT-STATE-006)  // Already confirmed or wrong state
+
+    storage_set_slot_status(active_slot, ACTIVE)
+    // Transition is atomic via metadata journal two-copy write
+    return OK
+```
+
+**Application integration:**
+
+```c
+// main.c — early init
+int main(void) {
+    hal_init();
+    sensors_init();
+    network_init();
+
+    // Confirm this firmware is healthy BEFORE starting the main loop.
+    // If we crash before this point, the bootloader reverts to the
+    // previous firmware on the next reset.
+    if (self_test_pass() && sensors_calibrated() && network_link_up()) {
+        boot_set_confirmed();  // TESTING → ACTIVE
+    }
+    // If we DON'T call boot_set_confirmed() and the device resets,
+    // the bootloader immediately reverts — no second chance.
+
+    // ... main loop ...
+}
+```
+
+**Failure scenarios:**
+
+| Scenario | Slot status before boot | Action |
+|---|---|---|
+| Normal boot, app confirms health | TESTING → boot_set_confirmed() → ACTIVE | Boot as ACTIVE next time |
+| App hardfaults before confirming | TESTING (never confirmed) | Immediate rollback to fallback |
+| Power loss during app init | TESTING (never confirmed) | Immediate rollback to fallback |
+| App confirms, normal reboot | ACTIVE | Normal boot |
+| App confirms, OTA updates other slot | ACTIVE → FALLBACK | Old image becomes safety net |
+| Both slots TESTING/INVALID | — | Enter FAILSAFE → serial recovery |
+
+**Comparison with N-attempt policy:**
+
+| Metric | N-Attempt Policy | Test/Confirm Model |
+|---|---|---|
+| Time to recovery | N × (boot_time + app_crash_time) | 1 × boot_time |
+| Unavailability window | 90 s (3 attempts × 30 s) | 0.3 s (immediate rollback) |
+| Application complexity | Must manage attempt counter | Single API call |
+| Transient fault tolerance | Tolerates N-1 faults | No tolerance (one crash = rollback) |
+| Counter reset attack surface | App must clear counter (can be spoofed) | Bootloader manages state (can't be spoofed) |
+
+**Transient fault mitigation:** The loss of N-attempt transient fault tolerance is addressed by application-level watchdogs and health checks. If the application can reboot cleanly but consistently fails health checks, it SHOULD be rolled back — the image has a real bug, not a transient fault. Hardware-level transients (EMI, power dip) that cause CPU faults should trigger the HardFault handler → error log → system reset, which the test/confirm model correctly treats as a failure.
+
+**Cost:** replaces N-attempt logic (~200 bytes code, 2 bytes metadata) with test/confirm logic (~100 bytes code, 1 byte metadata). Net savings: ~100 bytes code, 1 byte metadata.
 
 ---
 
@@ -2556,9 +2598,11 @@ EOL test (Python + pyOCD, after Pass 3 provisioning):
 int main(void) {
     *(volatile uint32_t *)0x2400_0004 = 0x41505000;  // "APP\0"
 
-    // Report boot health (see 3.11.3)
-    if (metadata_read_boot_attempt_count() > 0) {
-        metadata_set_boot_attempt_count(0);
+    // Confirm boot health — promotes slot from TESTING to ACTIVE.
+    // Must be called once after self-tests pass. See §3.11.3 (test/confirm model).
+    // The bootloader provides boot_set_confirmed() as a weak symbol.
+    if (self_test_pass() && sensors_ok()) {
+        boot_set_confirmed();
     }
     // ... rest of application init ...
 }
@@ -2642,20 +2686,20 @@ __attribute__((noreturn)) void __stack_chk_fail(void) {
 
 | # | Measure | Flash | Code | Prevents |
 |---|---|---|---|---|
-| 3.11.1 | Two-copy metadata journal | +256 B | +300 B | Power-loss slot corruption |
+| 3.11.1 | Tiered metadata journal (critical + frequent) | +12 KB (3 sectors) | +450 B | Power-loss slot corruption, NOR wear from per-boot erases |
 | 3.11.2 | NOR BP write-protect metadata | 0 | 0 B | Runaway write to metadata area |
-| 3.11.3 | Boot health N-attempt policy (prev_boot_phase) | +2 B | +200 B | False rollback on transient faults + power cycling |
+| 3.11.3 | Test/confirm model (immediate rollback) | 0 | +150 B | Multi-boot unavailability window from N-attempt |
 | 3.11.4 | Zero-tolerance header validation | 0 | 0 B | Malformed header parser confusion |
 | 3.11.5 | Anti-rollback (4-way redundant + min version + capped increment) | 0* | +200 B | Glitch bypass of version check, version inflation |
 | 3.11.6 | Manufacturing EOL power-cycle test | +8 B** | +2 insns | Undetected provisioning failures |
 | 3.11.7 | Compiler stack protection (-fstack-protector-strong) | +400 B | +0.5 ms | Stack buffer overflow → control-flow hijack |
 | 3.12   | Automatic slot fallback | 0 | +350 B | Single slot failure → permanent FAILSAFE |
 | 3.13   | IWDG hardware watchdog (800 ms, two-pass) | 0 | +200 B | Bootloader hang → unrecoverable |
-| **Total** | | **+667 B** | **+1,800 B** | |
+| **Total** | | **+12,667 B** | **+2,050 B** | |
 
 \* Uses bytes already allocated in NOR SR1. \** AXI SRAM, not flash.
 
-Total bootloader budget impact: ~1,800 bytes additional code, well within the ~57 KB reserved space. Updated bootloader .text: 37 KB → ~38.8 KB.
+Total bootloader budget impact: ~2,050 bytes additional code, well within the ~57 KB reserved space. Updated bootloader .text: 37 KB → ~39.0 KB. The 12 KB metadata area (three 4 KB sectors) fits within the 128 KB allocated metadata region at 0x20_0000.
 
 ---
 
@@ -3177,6 +3221,216 @@ function nor_detect_and_verify():
 
 **Cost:** +200 bytes code (IWDG init, refresh macros, NOR detect, RTC magic, Pass 2 fast path). Zero flash storage. Uses 1 of 32 RTC backup registers. Uses existing LSI oscillator (always running on STM32H750).
 
+---
+
+### 3.14 OTA Download Progress Journal
+
+**Problem:** OTA downloads over unreliable networks (cellular, LoRa, BLE) can be interrupted at any time. Without checkpointing, every interruption requires restarting the download from byte 0. For a 512 KB image over a 50 Kbps link (~82 seconds), a failure at 90% progress wastes ~74 seconds of download time and ~370 KB of bandwidth. On metered or power-constrained devices, this is unacceptable.
+
+MCUboot does not implement download resume natively — it relies on the application layer (MCUmgr/SMP) to handle interruption recovery. SBOP can improve on this by providing a built-in progress journal that survives power loss and enables HTTP Range resume without application involvement.
+
+**Design:** A 4 KB progress journal sector at NOR 0x20_3000 stores checkpoints as 64-byte records in a ring buffer. Each checkpoint records the total bytes written and a truncated running hash (first 8 bytes of SHA-256). On resume, the bootloader verifies existing data integrity against the stored hash before issuing an HTTP Range request from the last checkpoint offset.
+
+```
+Progress record (64 bytes):
+┌────────────────────────────┐
+│ [0]  magic          : u32  │ = 0x4F544150 ("OTAP")
+│ [4]  sequence       : u32  │ Chunk counter (0, 1, 2, ...)
+│ [8]  target_slot    : u8   │ SLOT_A or SLOT_B
+│ [9]  flags          : u8   │ Reserved
+│ [10] reserved       : u8[2]│
+│ [12] bytes_written  : u32  │ Total bytes written so far
+│ [16] total_size     : u32  │ Expected image size (from backend)
+│ [20] expected_hash  : u8[32]│ SHA-256 of full image
+│ [52] running_hash   : u8[8] │ Truncated SHA-256 of [0..bytes_written)
+│ [60] crc32          : u32  │ CRC-32 over bytes 0..59
+└────────────────────────────┘
+```
+
+**Checkpoint interval:** Every 32 KB of downloaded data. For a 512 KB image: 16 checkpoints per download, 4 full downloads per sector erase (64 records/sector × 1 record / 32 KB = 2,048 KB/sector).
+
+**Resume sequence:**
+
+```
+// On download start (or retry after interruption):
+function ota_download_with_resume(slot, info):
+    let prev = ota_progress_read_last()
+    let offset = 0
+
+    if prev.valid and prev.target_slot == slot
+       and prev.expected_hash == info.image_hash:
+        // Verify existing data before trusting checkpoint
+        let existing = storage_read_slot_range(slot, 0, prev.bytes_written)
+        if sha256(existing)[0..8] == prev.running_hash:
+            offset = prev.bytes_written
+            log("OTA resume: {} B already written", offset)
+        else:
+            // Data corrupt — restart
+            storage_erase_slot(slot)
+            ota_progress_clear()
+
+    // HTTP Range request from offset
+    let handle = http_get(info.url, headers={"Range": "bytes={}-".format(offset)})
+
+    // Download remaining data with periodic checkpoints
+    // ... (download loop with ota_progress_write every 32 KB) ...
+
+    // Success — clear progress journal
+    ota_progress_clear()
+```
+
+**Checkpoint write protocol (append-only, no erase until wrap):**
+
+```
+function ota_progress_write(bytes_written, running_hash):
+    let write_off = ota_progress_find_next_free()
+    if write_off >= 4096:
+        nor_spi_erase_sector(0x20_3000)  // Ring wrapped
+        write_off = 0
+    // Build and write 64 B record with CRC-32
+    nor_spi_page_program(0x20_3000 + write_off, record, 64)
+```
+
+**Read protocol (scan backward for last valid record):**
+
+```
+function ota_progress_read_last() -> Option<ProgressRecord>:
+    for off in (4096 - 64) down to 0 step 64:
+        data = nor_spi_read(0x20_3000 + off, 64)
+        if data[0..4] == 0x4F544150:           // Magic
+            if crc32(data[0..60]) == data[60..64]:
+                return parse(data)
+    return None  // Sector empty or all records corrupt
+```
+
+**Security considerations:**
+
+| Concern | Mitigation |
+|---------|-----------|
+| Attacker writes fake progress record to redirect download | Progress record doesn't control execution — only saves bytes_written. Resume requires matching expected_hash and running_hash. Fake record with wrong hash → restart from 0. |
+| Progress journal replay (old record from previous update) | expected_hash must match current UpdateInfo.image_hash. Every OTA has a unique hash → old records are silently ignored. |
+| Truncated running hash (8 bytes = 64 bits) | Sufficient for integrity check, not authentication. An attacker constructing data with the same truncated hash needs 2^64 attempts. Even if they succeed, the full SHA-256 verification at the end of download catches any discrepancy. |
+| Power loss during checkpoint write | CRC-32 catches partial writes. read_last() skips corrupt record and finds previous valid one. |
+
+**Why 8-byte running hash instead of full SHA-256:** The running hash is a data-integrity check, not a security boundary. Its purpose is to detect NOR flash corruption (stuck bits, partial writes) — not to authenticate the image. The full SHA-256 verification at the end of Phase 3 provides cryptographic authentication. An 8-byte truncated hash makes the record compact (64 bytes, clean alignment) while providing sufficient integrity detection: probability of undetected corruption < 2^-64 ≈ 5.4 × 10^-20.
+
+**Cost:** One 4 KB NOR sector at 0x20_3000, +~350 bytes code. Effectively free at boot time (not on the boot path — only used during OTA).
+
+**MCUboot comparison:** MCUboot delegates download resume to the application layer (MCUmgr/SMP). This is flexible but requires every application to implement its own checkpointing. SBOP's built-in progress journal provides resume capability at the platform level — any OTA client (HTTPS, CoAP, BLE, LoRa) benefits without application-level changes.
+
+---
+
+### 3.15 Measured Boot with Chained PCR Measurements
+
+**Problem:** Without measured boot, there is no way to prove to a remote verifier what firmware actually booted on the device. A compromised device can claim to be running any version. Remote attestation requires a tamper-evident log of boot events, where each event extends a cryptographic chain — modifying any event breaks the chain, making forgery computationally infeasible.
+
+MCUboot supports measured boot via BOOT_RECORD TLVs stored in the image TLV area, integrated with PSA Crypto's `psa_measure_boot()` API. SBOP adopts the same concept but stores measurements in the frequent journal (alongside other per-boot records) rather than in the image slot, enabling the measurement log to be read without parsing image TLVs.
+
+**Design:** Each boot extends a SHA-256 PCR (Platform Configuration Register) chain. The initial PCR is computed from the bootloader version and device identity. Each subsequent boot extends the chain with the booted image hash, slot, and boot result. The PCR value is stored in the FrequentRecord at offset 32.
+
+```
+PCR chain:
+
+PCR[0] = SHA-256("SBOP_MEASURED_BOOT_V1" || bootloader_version || device_uid)
+PCR[1] = SHA-256(PCR[0] || image_hash[0] || SLOT_A || PHASE_EXECUTE)
+PCR[2] = SHA-256(PCR[1] || image_hash[1] || SLOT_A || PHASE_EXECUTE)
+PCR[3] = SHA-256(PCR[2] || image_hash[2] || SLOT_B || PHASE_CONFIRMED)
+...
+
+Where:
+  bootloader_version : u32   = SBOP bootloader build version
+  device_uid         : u8[16]= DeviceID.uid (unique per device)
+  image_hash[N]      : u8[32]= SHA-256 of firmware image for boot N
+  slot               : u8    = SlotID (SLOT_A=0x00, SLOT_B=0x01)
+  boot_phase         : u8    = 0x01 (EXECUTE) or 0x02 (CONFIRMED)
+```
+
+**Boot flow integration (Phase 11 EXECUTE):**
+
+```
+let prev = frequent_journal_read_last()
+let prev_pcr = prev.valid ? prev.pcr_value : measured_boot_initial_pcr()
+let new_pcr = sha256(prev_pcr || header.hash || slot as u8 || 0x01)
+frequent_journal_append(0x01, boot_flags, iv_hash, new_pcr)
+```
+
+**Initial PCR computation:**
+
+```
+function measured_boot_initial_pcr() -> [u8; 32]:
+    return sha256("SBOP_MEASURED_BOOT_V1"
+                  || BOOTLOADER_VERSION as u32 LE
+                  || device_uid[0..16])
+```
+
+**Remote attestation verification:**
+
+A remote verifier (backend attestation service) validates the device's boot history by recomputing the PCR chain from the initial value:
+
+```
+// Verifier knows:
+//   - bootloader_version (from device registration)
+//   - device_uid (from attestation request)
+//   - expected image hashes for each authorized firmware version
+
+let computed_pcr = sha256("SBOP_MEASURED_BOOT_V1"
+                          || device.bootloader_version
+                          || device.device_uid)
+
+for each record in device.measurement_log:
+    computed_pcr = sha256(computed_pcr
+                          || record.image_hash
+                          || record.slot
+                          || record.boot_phase)
+
+if computed_pcr == device.current_pcr:
+    attestation_result = PASS
+else:
+    attestation_result = FAIL  // Measurement log tampered or unexpected boot
+```
+
+**Tamper-evidence property:** The SHA-256 chain makes it computationally infeasible to modify or remove a measurement record without detection. Changing record[N] changes PCR[N], which changes PCR[N+1], PCR[N+2], ..., all the way to the current PCR. The only way to forge a valid chain is to find a SHA-256 preimage (2^256 work factor) or recompute all subsequent hashes with the modified data (which requires knowing the correct image hashes for every boot).
+
+**Measurement log retrieval:** The application reads the frequent journal via a system call (`boot_get_measurement_log()`) and sends the records to the backend attestation service. The backend verifies the PCR chain and confirms the device booted only authorized firmware.
+
+```
+// Application attestation client:
+let measurements = boot_get_measurement_log()  // Returns FrequentRecord[]
+let attestation_report = {
+    device_uid: identity_get_device_id(),
+    current_pcr: measurements.last().pcr_value,
+    measurement_count: measurements.len(),
+    measurement_log: measurements,
+    signature: ed25519_sign(KD_Auth, attestation_report),
+}
+http_post(attestation_url, attestation_report)
+```
+
+**Storage and performance:**
+
+| Parameter | Value |
+|-----------|-------|
+| Record size | 64 bytes (was 32 B before measured boot) |
+| Records per sector | 64 (was 128) |
+| Sector erase interval | ~64 boots (at one boot/day: ~2 months) |
+| PCR computation cost | SHA-256 over 32+32+1+1 = 66 bytes per boot |
+| Attestation verification cost | SHA-256 over 66 bytes per boot in log (parallelizable) |
+
+**Comparison with MCUboot measured boot:**
+
+| Feature | MCUboot | SBOP |
+|---------|---------|------|
+| Measurement storage | BOOT_RECORD TLV in image slot | Frequent journal (separate metadata area) |
+| PCR algorithm | SHA-256 (PSA Crypto API) | SHA-256 (chained, same algorithm) |
+| Measurement types | SW_COMPONENT, SW_COMPONENT_CONFIG, etc. | Single unified measurement per boot |
+| API | `psa_measure_boot()` | `boot_get_measurement_log()` (application SVC) |
+| TCG/TPM alignment | Partial (PSA-style, not TPM PCR) | Same approach — PSA-style chained measurements |
+| Verification | Application-read + PSA attestation token | Application-read + Ed25519-signed attestation report |
+
+SBOP's measured boot is simpler than MCUboot's — a single measurement per boot rather than separate measurements for each software component and configuration. This is appropriate for a first-stage bootloader where the only measured components are the bootloader itself and the application image. Multi-stage bootloaders would extend the chain in each stage.
+
+**Cost:** The FrequentRecord grows from 32 to 64 bytes (+32 bytes). This halves the ring buffer capacity (128→64 records) but still provides ~2 months of daily-boot history. Code increase is negligible — the SHA-256 extend operation reuses the existing crypto engine. Zero additional NOR sectors.
+
 ## 4. Flash Layout
 
 ### 4.1 Internal Flash (128 KB) — Zone 1 Bootloader
@@ -3224,12 +3478,11 @@ Byte Address    Size      Region                  Contents
                                                     InnerSignatureBlock (116 B, plaintext)
                                                     Padding (~512 KB headroom)
 0x10_0000       1 MB      Slot B                  Firmware image (identical layout)
-0x20_0000       128 KB    Slot Metadata Area      Slot A Info (ImageInfo, 52 B)
-                                                   Slot B Info (ImageInfo, 52 B)
-                                                   Boot Count (Slot A, 32 B)
-                                                   Boot Count (Slot B, 32 B)
-                                                   Rollback Counter (32 B)
-                                                   Error Log (4 KB circular buffer)
+0x20_0000       128 KB    Slot Metadata Area      Critical Journal Copy A (4 KB sector, 128 B used)
+                                                   Critical Journal Copy B (4 KB sector at 0x20_1000)
+                                                   Frequent Journal ring buffer (4 KB sector at 0x20_2000)
+                                                   OTA Progress Journal (4 KB sector at 0x20_3000)
+                                                   Error Log (4 KB circular buffer at 0x20_4000)
                                                    Reserved
 0x22_0000       4 KB      Board Information Area  board_id (u16), board_name (char[32]), board_serial (char[32]), system_name (char[32]), system_serial (char[32]), config_flags (u32), crc32, reserved. Factory-provisioned, static.
 0x22_1000       4 KB      KV Storage Area         Bootloader region (2 KB): board info populated at boot.
@@ -3282,38 +3535,58 @@ After first boot (bootloader re-encrypts):
   K_s zeroized — never needed again
 ```
 
-**Slot metadata layout (two-copy journal, NOR 0x20_0000):**
+**Slot metadata layout (tiered journal, NOR 0x20_0000):**
 
-Two independent 512-byte copies (A and B) with monotonic sequence numbers provide atomic updates that survive power loss at any point. The copy with the higher valid sequence number is authoritative. See §3.11.1 for write/read protocol.
+Metadata is split into two independent journals with different update frequencies. The critical journal (slot state, version ceiling) uses two-copy atomic writes in separate 4 KB sectors. The frequent journal (per-boot counters, IV hash) uses a simple ring buffer in its own sector. See §3.11.1 for detailed write/read protocol.
 
 ```
-Copy A (0x20_0000):                        Copy B (0x20_0200):
-Offset   Size  Field                       Offset   Size  Field
-───────  ────  ─────────────────────       ───────  ────  ─────────────────────
-0x000    4 B   sequence : u32              0x200    4 B   sequence : u32
+Critical Journal — Copy A (0x20_0000, 4 KB sector):
+Offset   Size  Field
+───────  ────  ─────────────────────────────────
+0x000    4 B   sequence : u32
                (odd = writing, even = committed)
-0x004    1 B   active_slot                 0x204    1 B   active_slot
-0x005    1 B   boot_target                 0x205    1 B   boot_target
-0x006    1 B   re_encrypt_state            0x206    1 B   re_encrypt_state
+0x004    1 B   active_slot
+0x005    1 B   boot_target
+0x006    1 B   re_encrypt_state
                (0x00 = idle, 0x01 = staged, 0x02 = committed)
-0x007    1 B   boot_attempt_count          0x207    1 B   boot_attempt_count
-               (0 = healthy, N = consecutive EXECUTE boots without health report)
-0x008    1 B   prev_boot_phase             0x208    1 B   prev_boot_phase
-               (0x00 = did not reach EXECUTE, 0x01 = reached EXECUTE)
-0x009   52 B   slot_a_info (ImageInfo)     0x209   52 B   slot_a_info (ImageInfo)
-0x03D   52 B   slot_b_info (ImageInfo)     0x23D   52 B   slot_b_info (ImageInfo)
-0x071    4 B   boot_count_a                0x271    4 B   boot_count_a
-0x075    4 B   boot_count_b                0x275    4 B   boot_count_b
-0x079    4 B   rollback_count              0x279    4 B   rollback_count
-0x07D  111 B   reserved                    0x27D  111 B   reserved
-0x0EC    4 B   crc32                      0x2EC    4 B   crc32
-              (over bytes 0x000–0x0EB)               (over bytes 0x200–0x2EB)
-───────  ────                             ───────  ────
-512 bytes total                           512 bytes total
+0x007    1 B   reserved
+0x008   52 B   slot_a_info (ImageInfo: status, version, hash, flags, timestamp, boot_count)
+0x03C   52 B   slot_b_info (ImageInfo)
+0x070    4 B   max_allowed_version
+0x074    8 B   reserved2
+0x07C    4 B   crc32 (over bytes 0x000–0x07B)
+───────  ────
+128 bytes total. Rest of 4 KB sector unused.
 
-Remaining metadata sector space:
-0x0400    4 KB   error_log                 Circular error log buffer
-0x1400   ~112 KB reserved                  Future expansion
+Critical Journal — Copy B (0x20_1000, separate 4 KB sector):
+Offset   Size  Field
+───────  ────  ─────────────────────────────────
+0x000    4 B   sequence : u32
+0x004  124 B   (identical fields to Copy A bytes 0x004–0x07C)
+───────  ────
+128 bytes total. Rest of 4 KB sector unused.
+
+Frequent Journal — Ring Buffer (0x20_2000, 4 KB sector):
+Offset   Size  Field
+───────  ────  ─────────────────────────────────
+0x000   64 B   Record 0: {boot_seq(u32), prev_boot_phase(u8), flags(u8),
+               reserved(u8[2]), last_iv_hash(u8[24]), pcr_value(u8[32])}
+0x040   64 B   Record 1
+  ...    ...   ...
+0xFC0   64 B   Record 63
+───────  ────
+64 records × 64 bytes = 4 KB. Append-only ring buffer.
+CRC-16-CCITT per record at bytes 62-63. Scan backward for last valid record.
+Erased once per ~64 boots when ring wraps.
+pcr_value provides chained measurement for remote attestation (measured boot).
+
+Remaining metadata region:
+0x20_3000   4 KB   ota_progress             OTA download progress journal (ring buffer, 64 B × 64 records)
+                                            Magic: 0x4F544150 ("OTAP"). Records: sequence, target_slot,
+                                            bytes_written, total_size, expected_hash, running_hash, CRC-32.
+                                            Erased on download completion. Survives power loss for resume.
+0x20_4000   4 KB   error_log                Circular error log buffer
+0x20_5000  ~108 KB reserved                 Future expansion
 ```
 
 **Board Information Area (4 KB sector at NOR 0x22_0000):**
@@ -3411,12 +3684,12 @@ Phase 5 (VERIFY_SIGNATURE) + Phase 6 (VERIFY_INTEGRITY) — combined streaming p
   // Detect by storing hash of last-used IV.
   1h. iv_current = nor_read(slot_base + 80, 16)
   1i. iv_hash = sha256(iv_current || kd_identifier)       // KD_identifier: first 16 B of KD
-  1j. last_iv_hash = metadata_read_last_iv_hash()
-  1k. assert(constant_time_compare(iv_hash, last_iv_hash, 32) == false,
-             ERR-BOOT-CRYPTO-007)                         // IV reuse detected — possible replay
-  1l. // Update metadata with new IV hash (committed after successful boot)
-      metadata_set_last_iv_hash(iv_hash)
-
+  1j. last_record = frequent_journal_read_last()
+  1k. if last_record.valid:
+          assert(constant_time_compare(iv_hash[0..24], last_record.last_iv_hash, 24) == false,
+                 ERR-BOOT-CRYPTO-007)                     // IV reuse detected - possible replay
+  1l. // IV hash recorded in Phase 11 via frequent_journal_append()
+      // (ring buffer, 32 B record - no sector erase needed)
   // Common decrypt path:
   2.  Configure HW CRYP: AES-256-CTR, key = K_s or KD, IV from NOR
   3.  Configure HW HASH: SHA-256, start

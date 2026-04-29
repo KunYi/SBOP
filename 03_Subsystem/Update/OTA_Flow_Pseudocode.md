@@ -73,7 +73,7 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
     )
     assert(sig_valid == true, ERR-OTA-AUTH-001)
     
-    // ── Phase 3: Download Firmware ──
+    // ── Phase 3: Download Firmware with Progress Journal ──
     state = OTA_DOWNLOAD
     let inactive_slot = storage_get_inactive_slot()
     assert(inactive_slot != SLOT_INVALID, ERR-OTA-DOWNLOAD-003)
@@ -82,10 +82,40 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
     if storage_get_slot_status(inactive_slot) != EMPTY:
         storage_erase_slot(inactive_slot)?
     
-    // Download with hash verification per chunk
-    let download_handle = http_download_begin(info.download_url)
-    let running_hash = hash_init(SHA256)
+    // Initialize progress journal for resume-on-interrupt
+    let progress = ota_progress_init(inactive_slot, info.image_size, info.image_hash)
+    
+    // Check if a previous partial download can be resumed
+    let prev_progress = ota_progress_read_last()
     let bytes_written = 0
+    let running_hash = hash_init(SHA256)
+    
+    if prev_progress.valid
+       and prev_progress.target_slot == inactive_slot
+       and prev_progress.expected_hash == info.image_hash:
+        // Resume from checkpoint: verify existing data integrity
+        let existing_data = storage_read_slot_range(inactive_slot, 0, prev_progress.bytes_written)
+        let existing_hash = crypto_compute_hash(existing_data)
+        let truncated = existing_hash[0..8]  // First 8 bytes of SHA-256
+        if constant_time_compare(truncated, prev_progress.running_hash, 8):
+            // Existing data valid — resume from where we left off
+            bytes_written = prev_progress.bytes_written
+            running_hash = hash_init(SHA256)
+            running_hash = hash_update(running_hash, existing_data)
+            log("OTA resume: {} bytes already downloaded", bytes_written)
+        else:
+            // Existing data corrupt — restart from beginning
+            storage_erase_slot(inactive_slot)?
+            ota_progress_clear()
+            log("OTA resume failed: data corrupt, restarting download")
+    else:
+        // Fresh download — clear any stale progress
+        ota_progress_clear()
+    
+    // Download with per-chunk hash verification and checkpoint journaling.
+    // Checkpoints written every PROGRESS_CHECKPOINT_INTERVAL bytes (32 KB).
+    let download_handle = http_download_begin(info.download_url, start_offset = bytes_written)
+    let last_checkpoint = bytes_written
     
     loop:
         let chunk = http_download_chunk(download_handle, CHUNK_SIZE)
@@ -101,9 +131,17 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
                     let expected = info.chunk_hashes[current_chunk_index]
                     assert(constant_time_compare(chunk_hash, expected, 32), ERR-OTA-DOWNLOAD-002)
                 
+                // Write progress checkpoint every 32 KB (or at download end)
+                if bytes_written - last_checkpoint >= PROGRESS_CHECKPOINT_INTERVAL
+                   or bytes_written == info.image_size:
+                    let truncated_hash = hash_clone(running_hash).finalize()[0..8]
+                    ota_progress_write(bytes_written, truncated_hash)
+                    last_checkpoint = bytes_written
+                
             case End:
                 break
             case Error(e):
+                // Preserve progress for resume — don't clear journal
                 http_download_abort(download_handle)
                 return Err(ERR-OTA-DOWNLOAD-001)
     
@@ -112,6 +150,9 @@ function ota_perform_update(check_result: UpdateCheckResult) -> Result<(), OTAEr
     // Verify full image hash
     assert(constant_time_compare(final_hash, info.image_hash, 32), ERR-OTA-DOWNLOAD-002)
     assert(bytes_written == info.image_size, ERR-OTA-DOWNLOAD-002)
+    
+    // Download complete — clear progress journal
+    ota_progress_clear()
     
     // ── Phase 4: Verify Downloaded Image ──
     state = OTA_VERIFY
@@ -298,8 +339,180 @@ function ota_recover_from_interruption() -> Result<SlotStatus, OTAError>:
 | Error | Strategy |
 | --- | --- |
 | ERR-OTA-AUTH-001 | Retry with exponential backoff (1s, 2s, 4s, 8s); max 5 retries |
-| ERR-OTA-DOWNLOAD-001 | Resume from last received chunk (HTTP Range) |
+| ERR-OTA-DOWNLOAD-001 | Resume from last progress journal checkpoint (HTTP Range, §9) |
 | ERR-OTA-DOWNLOAD-002 | Discard; restart download from beginning |
 | ERR-OTA-DOWNLOAD-003 | Abort; wait for storage availability or battery charge |
 | ERR-OTA-INSTALL-001/002 | Retry write (max 3 attempts); then mark slot bad; try other slot |
 | ERR-OTA-ACTIVATE-001/002 | Automatic rollback to fallback slot |
+
+---
+
+## 9. OTA Progress Journal API
+
+The progress journal enables download resume after power loss or network interruption. It stores checkpoints in a ring buffer at NOR 0x20_3000 (4 KB sector, 64 records × 64 bytes). Each checkpoint records the bytes written and a truncated running hash for integrity verification on resume.
+
+### 9.1 ProgressRecord Structure
+
+```
+struct ProgressRecord:                                // 64 bytes total
+    magic:          u32 = 0x4F544150 ("OTAP")        // [0]  Record magic
+    sequence:       u32                               // [4]  Chunk counter (0, 1, 2, ...)
+    target_slot:    u8                                // [8]  SLOT_A or SLOT_B
+    flags:          u8                                // [9]  Reserved (must be 0)
+    reserved:       u8[2]                             // [10] Reserved
+    bytes_written:  u32                               // [12] Total bytes written so far
+    total_size:     u32                               // [16] Expected total image size
+    expected_hash:  [u8; 32]                          // [20] SHA-256 of full image (from UpdateInfo)
+    running_hash:   [u8; 8]                           // [52] Truncated SHA-256 of data written so far
+    crc32:          u32                               // [60] CRC-32 over bytes 0..59
+```
+
+### 9.2 Progress Journal Operations
+
+```
+const PROGRESS_JOURNAL_BASE:   u32 = 0x20_3000
+const PROGRESS_RECORD_SIZE:    u32 = 64
+const PROGRESS_SECTOR_SIZE:    u32 = 4096
+const PROGRESS_MAX_RECORDS:    u32 = 64
+const PROGRESS_CHECKPOINT_INTERVAL: u32 = 32768  // 32 KB between checkpoints
+
+
+/// Initialize a new progress journal entry for a download.
+/// Called once at the start of Phase 3 (DOWNLOAD).
+function ota_progress_init(slot: SlotID, total_size: u32, expected_hash: &[u8; 32]):
+    // Erase the progress journal sector if it's been used before
+    // (only if first record slot is occupied — lazy erase)
+    let first_word = nor_spi_read(PROGRESS_JOURNAL_BASE, 4)
+    if first_word != 0xFFFFFFFF:
+        ota_progress_clear()
+
+
+/// Write a progress checkpoint to the journal ring buffer.
+/// Called every PROGRESS_CHECKPOINT_INTERVAL bytes during download.
+/// No sector erase unless the ring wraps (once per 64 checkpoints).
+function ota_progress_write(bytes_written: u32, running_hash: &[u8; 8]):
+    let last = ota_progress_read_last()
+    let new_seq = (last.valid) ? last.sequence + 1 : 0
+
+    let write_off = ota_progress_find_next_free()
+    if write_off >= PROGRESS_SECTOR_SIZE:
+        // Ring full — erase and restart
+        nor_spi_write_enable()
+        nor_spi_erase_sector(PROGRESS_JOURNAL_BASE)
+        nor_spi_wait_busy()
+        write_off = 0
+
+    let mut record = [0u8; 64]
+    record[0..4]   = 0x4F544150 as u32          // "OTAP"
+    record[4..8]   = new_seq as u32
+    record[8]      = g_progress.target_slot as u8
+    record[9]      = 0x00                        // flags
+    record[10..12] = [0u8, 0u8]                  // reserved
+    record[12..16] = bytes_written as u32
+    record[16..20] = g_progress.total_size as u32
+    record[20..52] = g_progress.expected_hash
+    record[52..60] = running_hash[0..8]
+    record[60..64] = crc32(record[0..60])
+
+    nor_spi_page_program(PROGRESS_JOURNAL_BASE + write_off, record, 64)
+
+    // Verify write
+    let verify = nor_spi_read(PROGRESS_JOURNAL_BASE + write_off, 64)
+    assert(memcmp(record, verify, 64) == 0, ERR-STOR-WRITE-001)
+
+
+/// Read the most recent valid progress record.
+/// Scans backward from end of sector for first record with valid magic + CRC-32.
+/// Returns None if sector is empty or all records are corrupt.
+function ota_progress_read_last() -> Option<ProgressRecord>:
+    for off in (PROGRESS_SECTOR_SIZE - PROGRESS_RECORD_SIZE) down to 0
+             step PROGRESS_RECORD_SIZE:
+        let data = nor_spi_read(PROGRESS_JOURNAL_BASE + off, 64)
+        if data[0..4] != 0xFFFFFFFF:                    // Not erased
+            if data[0..4] as u32 == 0x4F544150           // Magic matches
+               and crc32(data[0..60]) == data[60..64] as u32:  // CRC valid
+                return Some(ProgressRecord{
+                    magic:         0x4F544150,
+                    sequence:      data[4..8] as u32,
+                    target_slot:   data[8] as SlotID,
+                    flags:         data[9],
+                    bytes_written: data[12..16] as u32,
+                    total_size:    data[16..20] as u32,
+                    expected_hash: data[20..52],
+                    running_hash:  data[52..60],
+                })
+    return None
+
+
+/// Find the next free record slot (first erased 64-byte aligned offset).
+function ota_progress_find_next_free() -> u32:
+    for off in 0..PROGRESS_SECTOR_SIZE step PROGRESS_RECORD_SIZE:
+        let header = nor_spi_read(PROGRESS_JOURNAL_BASE + off, 4)
+        if header == 0xFFFFFFFF:
+            return off
+    return PROGRESS_SECTOR_SIZE  // Sector full
+
+
+/// Clear the progress journal (erase sector). Called after successful download.
+function ota_progress_clear():
+    nor_spi_write_enable()
+    nor_spi_erase_sector(PROGRESS_JOURNAL_BASE)
+    nor_spi_wait_busy()
+
+
+// Global progress state (volatile, rebuilt from journal on resume)
+static g_progress: struct {
+    target_slot:    SlotID,
+    total_size:     u32,
+    expected_hash:  [u8; 32],
+}
+```
+
+### 9.3 Resume Flow
+
+```
+// Called at ota_perform_update() entry, before starting download.
+// Determines whether to resume or restart.
+
+function ota_try_resume(inactive_slot: SlotID,
+                        info: UpdateInfo) -> (u32, HashState):
+    let prev = ota_progress_read_last()
+
+    if not prev.valid:
+        return (0, hash_init(SHA256))  // Fresh download
+
+    // Validate resume is for the same update
+    if prev.target_slot != inactive_slot:
+        ota_progress_clear()
+        return (0, hash_init(SHA256))
+
+    if prev.expected_hash != info.image_hash:
+        ota_progress_clear()
+        return (0, hash_init(SHA256))
+
+    // Verify existing data integrity
+    let existing = storage_read_slot_range(inactive_slot, 0, prev.bytes_written)
+    let existing_hash = crypto_compute_hash(existing)
+
+    if constant_time_compare(existing_hash[0..8], prev.running_hash, 8):
+        // Data intact — rebuild running hash and resume
+        let mut hash_state = hash_init(SHA256)
+        hash_state = hash_update(hash_state, existing)
+        return (prev.bytes_written, hash_state)
+    else:
+        // Data corrupt — must restart
+        storage_erase_slot(inactive_slot)?
+        ota_progress_clear()
+        log("OTA resume: existing data corrupt, restarting")
+        return (0, hash_init(SHA256))
+```
+
+### 9.4 Power-Loss Analysis
+
+| Failure Point | What Happens | Resume Behavior |
+|---------------|-------------|-----------------|
+| Power loss between checkpoints | Last checkpoint ≤ 32 KB behind actual write position | Resume from last checkpoint. HTTP Range re-downloads up to 32 KB of duplicate data — harmless. |
+| Power loss during checkpoint write | Partial 64 B record, CRC-32 mismatch | `read_last()` skips corrupt record, finds previous valid checkpoint |
+| Power loss during sector erase (ring wrap) | All records lost | Fresh download required — no worse than no progress journal |
+| Power loss during slot write (not checkpoint) | NOR page program incomplete | Slot data at that offset is 0xFF. Running hash mismatch on resume → restart. |
+| Backend changes image between attempts | expected_hash differs from stored | `ota_try_resume()` detects hash mismatch, clears journal, fresh download |

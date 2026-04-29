@@ -81,6 +81,9 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-BOOT-STATE-001 | FATAL | Invalid state transition | Attempted transition not allowed in state machine | FAILSAFE | Reset; if persistent: hardware fault |
 | ERR-BOOT-STATE-002 | FATAL | State machine integrity check failed | State variable CRC/parity mismatch (possible fault injection) | FAILSAFE | Reboot; tamper investigation |
 | ERR-BOOT-STATE-003 | FATAL | Redundant check mismatch | Two verification paths disagreed (possible fault injection) | FAILSAFE | Reboot; tamper investigation |
+| ERR-BOOT-STATE-004 | FATAL | No bootable slot | Both slots are INVALID, CORRUPT, or EMPTY | FAILSAFE | Serial recovery or re-provision |
+| ERR-BOOT-STATE-005 | ERROR | Unconfirmed image reverted | Slot was in TESTING state — application did not call boot_set_confirmed() before reset | Immediate rollback to fallback | Application must confirm health after update |
+| ERR-BOOT-STATE-006 | ERROR | Confirm called on non-TESTING slot | boot_set_confirmed() called but slot is already ACTIVE or in another state | Return error to caller | Application should check slot status first |
 
 ### 4.4 Version Errors
 
@@ -236,9 +239,24 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 
 ---
 
-## 10. Error Handling Rules
+## 10. Serial Recovery Protocol Errors
 
-### 10.1 General Rules
+| Error ID | Severity | Description | Detail | Handling | Recovery |
+| --- | --- | --- | --- | --- | --- |
+| ERR-SRP-AUTH-001 | ERROR | Authentication required | Command requires authenticated session | Return error to host | Host must send AUTH_CHALLENGE + AUTH_RESPONSE |
+| ERR-SRP-AUTH-002 | ERROR | Session expired | Auth session timeout elapsed | Return error to host | Host must re-authenticate |
+| ERR-SRP-AUTH-003 | ERROR | Brute-force lockout active | Too many failed auth attempts | Return error to host; include retry-after hint | Host must wait for lockout period |
+| ERR-SRP-FRAME-001 | ERROR | Invalid frame | Bad magic (not 0x5352) or CRC-16 mismatch | Discard frame silently | Host must re-sync and retransmit |
+| ERR-SRP-FRAME-002 | ERROR | Frame too large | Declared length > 2048 bytes | Discard frame | Host must fragment payload |
+| ERR-SRP-FRAME-003 | ERROR | Sequence mismatch | Frame sequence number out of order | Discard frame; do not NAK (prevents ACK storm) | Host re-syncs on timeout |
+| ERR-SRP-CMD-001 | ERROR | Unknown opcode | Received opcode is not recognized | Return error to host | Host must check protocol version |
+| ERR-SRP-CMD-002 | ERROR | Invalid state | Command not permitted in current protocol state | Return error to host | Host must check device state first |
+
+---
+
+## 11. Error Handling Rules
+
+### 11.1 General Rules
 
 | Rule | Description |
 | --- | --- |
@@ -248,7 +266,7 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | ERR-RULE-004 | Error codes returned across trust boundaries must be sanitized (no stack/internals) |
 | ERR-RULE-005 | All error paths must be tested (→ `05_Verification/Test_Cases.md`) |
 
-### 10.2 Error Propagation Across Subsystems
+### 11.2 Error Propagation Across Subsystems
 
 | From → To | Propagation Rule |
 | --- | --- |
@@ -259,7 +277,7 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 
 ---
 
-## 11. Error Code Allocation Table
+## 12. Error Code Allocation Table
 
 | Subsystem | Error Range | Available Codes | Used Codes |
 | --- | --- | --- | --- |
@@ -284,3 +302,6 @@ ERR-<COMPONENT>-<CATEGORY>-<ID>
 | Identity: CLONE | ERR-ID-CLONE-001..099 | 99 | 2 |
 | Storage | ERR-STOR-001..099 | 99 | 4 |
 | Hardware | ERR-HW-001..099 | 99 | 7 |
+| SRP: AUTH | ERR-SRP-AUTH-001..099 | 99 | 3 |
+| SRP: FRAME | ERR-SRP-FRAME-001..099 | 99 | 3 |
+| SRP: CMD | ERR-SRP-CMD-001..099 | 99 | 2 |

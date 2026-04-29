@@ -126,7 +126,10 @@ struct SignatureBlock {
 
 ```rust
 /// Metadata about a firmware image in a slot.
-/// Returned by boot subsystem queries.
+/// Stored in the critical metadata journal (updated on slot transitions only).
+/// boot_count is a cumulative count — it reflects the total boots at the time
+/// of the last slot state transition, not the current per-boot count.
+/// Per-boot counters are maintained in the frequent journal (FrequentRecord).
 struct ImageInfo {
     slot:             SlotID,    // Which slot this image is in
     status:           SlotStatus,// Current state of the slot
@@ -134,7 +137,7 @@ struct ImageInfo {
     image_hash:       [u8; 32],  // SHA-256 of payload
     flags:            u32,       // Feature flags from header
     build_timestamp:  u64,       // Unix timestamp of build (optional)
-    boot_count:       u32,       // Number of times this image has booted
+    boot_count:       u32,       // Cumulative boot count at last slot transition
 }
 ```
 
@@ -153,10 +156,11 @@ enum SlotStatus: u8 {
     EMPTY       = 0x00,  // Slot contains no image
     PENDING     = 0x01,  // Image ready for boot verification
     VERIFYING   = 0x02,  // Boot verification in progress
-    ACTIVE      = 0x03,  // Image is the active running firmware
-    FALLBACK    = 0x04,  // Image is active but previous version (after rollback)
-    INVALID     = 0x05,  // Image failed verification
-    CORRUPT     = 0x06,  // Storage corruption detected in this slot
+    TESTING     = 0x03,  // Image is active but unconfirmed (first boot after update)
+    ACTIVE      = 0x04,  // Image is the active confirmed firmware
+    FALLBACK    = 0x05,  // Image is active but previous version (after rollback)
+    INVALID     = 0x06,  // Image failed verification
+    CORRUPT     = 0x07,  // Storage corruption detected in this slot
 }
 ```
 
@@ -164,14 +168,18 @@ enum SlotStatus: u8 {
 
 ```
 EMPTY ──(write)──> PENDING
-PENDING ──(verify OK)──> ACTIVE
+PENDING ──(verify OK, first boot)──> TESTING
 PENDING ──(verify fail)──> INVALID
+TESTING ──(app confirms health)──> ACTIVE
+TESTING ──(reset without confirm)──> INVALID  // Immediate rollback — no retry count
 ACTIVE ──(new update to other slot)──> FALLBACK
 ACTIVE ──(corruption detected)──> CORRUPT
-FALLBACK ──(replaced by new update)──> PENDING
+FALLBACK ──(replaced by new update)──> Pending
 INVALID ──(new write)──> PENDING
 CORRUPT ──(reformat)──> EMPTY
 ```
+
+**Key difference from N-attempt policy:** TESTING → INVALID occurs on the FIRST reset without confirmation, not after N failed boots. This matches MCUboot's test/confirm model: the application gets exactly one chance to prove itself healthy. If it fails to call `boot_set_confirmed()` before the next reset (any reset — watchdog, power cycle, crash), the bootloader immediately reverts to the fallback slot. This eliminates the N-boot unavailability window and prevents a crashing application from consuming multiple boot attempts.
 
 ---
 
@@ -318,7 +326,149 @@ struct DebugAuthResponse {
 
 ---
 
-## 14. Serialization Rules
+## 14. CriticalMetadata
+
+```rust
+/// Critical metadata journal entry (128 bytes).
+/// Stored in two-copy atomic journal at NOR 0x20_0000 + 0x20_1000.
+/// Updated ONLY on OTA/slot transitions — NOT every boot.
+/// Power-loss safe via two-copy atomic protocol with monotonic sequence numbers.
+struct CriticalMetadata {
+    sequence:          u32,       // Monotonic (odd=writing, even=committed)
+    active_slot:       SlotID,    // Currently active (confirmed) slot
+    boot_target:       SlotID,    // Slot to attempt boot from
+    re_encrypt_state:  u8,        // 0x00=idle, 0x01=staged, 0x02=committed
+    reserved:          u8,        // Must be zero
+    slot_a_info:       ImageInfo, // Slot A metadata (52 B)
+    slot_b_info:       ImageInfo, // Slot B metadata (52 B)
+    max_allowed_version: u32,     // Anti-rollback version ceiling
+    reserved2:         [u8; 8],   // Must be zero
+    crc32:             u32,       // CRC-32 over bytes 0..124
+}
+// Total: 128 bytes
+```
+
+### 14.1 re_encrypt_state Values
+
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0x00 | RE_STATE_IDLE | No re-encrypt in progress |
+| 0x01 | RE_STATE_STAGED | KD-encrypted data written to staging area, ready to commit |
+| 0x02 | RE_STATE_COMMITTED | Staging data committed, old area pending erase |
+
+---
+
+## 15. FrequentRecord
+
+```rust
+/// Per-boot record in the frequent journal ring buffer (64 bytes).
+/// Stored in ring buffer at NOR 0x20_2000 (4 KB sector, 64 records).
+/// Appended on every successful boot — no sector erase until ring wraps.
+/// Power-loss safe by design: losing a record only loses that boot's counters,
+/// never affects critical slot state.
+/// The pcr_value field provides a chained measurement for remote attestation
+/// (measured boot, see §15.3). Each record extends the chain from the previous.
+struct FrequentRecord {
+    boot_seq:        u32,       // [0]  Monotonic boot counter (1, 2, 3, ...)
+    prev_boot_phase: u8,        // [4]  0x00=did not reach EXECUTE, 0x01=reached EXECUTE, 0x02=confirmed
+    flags:           u8,        // [5]  bit0=was_testing, bit1=was_fallback, bits2-7=reserved
+    reserved:        [u8; 2],   // [6]  Must be zero
+    last_iv_hash:    [u8; 24],  // [8]  Truncated SHA-256(IV_dev || KD[0..16]) for IV reuse detection
+    pcr_value:       [u8; 32],  // [32] SHA-256 chained measurement (see §15.3)
+}
+// Total: 64 bytes. CRC-16 over bytes 0..62 stored at bytes [62..64].
+```
+
+### 15.1 prev_boot_phase Values
+
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0x00 | PHASE_NONE | Boot did not reach EXECUTE (crashed or failed verification) |
+| 0x01 | PHASE_EXECUTE | Bootloader reached EXECUTE and jumped to application |
+| 0x02 | PHASE_CONFIRMED | Application called boot_set_confirmed() (promoted TESTING→ACTIVE) |
+
+### 15.2 flags Bit Definitions
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 0 | FLAG_WAS_TESTING | This boot's slot was in TESTING state (image unconfirmed) |
+| 1 | FLAG_WAS_FALLBACK | This boot used the fallback slot (after rollback) |
+| 2-7 | Reserved | Must be zero |
+
+### 15.3 Measured Boot PCR Chain
+
+The `pcr_value` field implements a chained measurement log similar to TPM Platform Configuration Registers (PCRs). Each boot extends the chain from the previous boot's measurement, creating a tamper-evident log. A remote attestation verifier can validate the entire boot history by recomputing the chain.
+
+```
+PCR[0] = SHA-256("SBOP_MEASURED_BOOT_V1" || bootloader_version || device_uid)
+PCR[n] = SHA-256(PCR[n-1] || image_hash[0..32] || slot || boot_phase)
+```
+
+Where:
+- `bootloader_version`: u32 version of the bootloader itself
+- `device_uid`: u8[16] unique device identifier (from DeviceID.uid)
+- `image_hash`: u8[32] SHA-256 of the booted firmware image
+- `slot`: SlotID of the booted image
+- `boot_phase`: u8 boot result (0x01 = EXECUTE, 0xFF = FAILSAFE)
+
+**Extend operation** (Phase 11 EXECUTE):
+
+```
+let prev = frequent_journal_read_last()
+let prev_pcr = prev.valid ? prev.pcr_value : initial_pcr()
+let new_pcr = sha256(prev_pcr || header.hash || slot as u8 || 0x01)
+```
+
+**Attestation verification** (remote verifier):
+
+```
+// Recompute the chain from the initial PCR
+let expected = initial_pcr(device_uid)
+for each measurement in measurement_log:
+    expected = sha256(expected || measurement.image_hash || measurement.slot || measurement.boot_phase)
+assert(expected == device.current_pcr)
+```
+
+**Tamper-evidence:** Any modification to a measurement record changes that record's pcr_value, which breaks the chain for all subsequent records. The verifier detects this immediately — the final PCR won't match the recomputed chain. There is no way to forge a valid chain without knowing all previous measurements and computing SHA-256 preimages (computationally infeasible).
+
+---
+
+## 16. ProgressRecord
+
+```rust
+/// OTA download progress checkpoint (64 bytes).
+/// Stored in ring buffer at NOR 0x20_3000 (4 KB sector, 64 records).
+/// Written every 32 KB during OTA download. Enables HTTP Range resume
+/// after power loss or network interruption.
+/// Cleared on successful download completion.
+struct ProgressRecord {
+    magic:          u32,       // 0x4F544150 ("OTAP") — record magic
+    sequence:       u32,       // Chunk counter (0, 1, 2, ...)
+    target_slot:    SlotID,    // SLOT_A or SLOT_B — which slot is being written
+    flags:          u8,        // Reserved (must be 0)
+    reserved:       [u8; 2],   // Must be zero
+    bytes_written:  u32,       // Total bytes written so far
+    total_size:     u32,       // Expected total image size (from UpdateInfo)
+    expected_hash:  [u8; 32],  // SHA-256 of full image (from backend)
+    running_hash:   [u8; 8],   // Truncated SHA-256 of data[0..bytes_written)
+    crc32:          u32,       // CRC-32 over bytes 0..59
+}
+// Total: 64 bytes
+```
+
+### 16.1 Validation Rules
+
+| Rule | Description |
+|------|-------------|
+| R-PROG-001 | `magic` must == 0x4F544150 |
+| R-PROG-002 | `crc32` must match computed CRC-32 over bytes 0..59 |
+| R-PROG-003 | On resume, `expected_hash` must match current UpdateInfo.image_hash |
+| R-PROG-004 | On resume, stored data[0..bytes_written] SHA-256[0..8] must match `running_hash` |
+| R-PROG-005 | `target_slot` must be SLOT_A or SLOT_B (not SLOT_INVALID) |
+
+---
+
+## 17. Serialization Rules
 
 | Rule | Description |
 | --- | --- |
@@ -332,13 +482,16 @@ struct DebugAuthResponse {
 
 ---
 
-## 15. Size Budgets
+## 18. Size Budgets
 
 | Structure | Size | Notes |
 | --- | --- | --- |
 | ImageHeader | 80 bytes | Fixed (header_size = 80) |
-| SignatureBlock (Ed25519) | 116 bytes | 1+1+2+4+32+72+4 (algorithm + key_index + sig_length + reserved + public_key + signature + crc32) |
-| ImageInfo | 52 bytes | + variable fields |
+| SignatureBlock (Ed25519) | 116 bytes | 1+1+2+4+32+72+4 |
+| ImageInfo | 52 bytes | Fixed |
+| CriticalMetadata | 128 bytes | Two copies = 256 B NOR |
+| FrequentRecord | 64 bytes | 64 records per 4 KB sector. Includes 32 B PCR value for measured boot. |
+| ProgressRecord | 64 bytes | 64 records per 4 KB sector |
 | DeviceID | 24 bytes | Fixed |
 | KeyRef | 8 bytes | Fixed |
 | AuthToken | 56 bytes | Fixed |
@@ -347,5 +500,8 @@ struct DebugAuthResponse {
 | TelemetryRecord | 62 bytes | Fixed |
 | DebugAuthChallenge | 56 bytes | Fixed |
 | DebugAuthResponse | 36 bytes | Fixed |
+| **Total** | **1,010 bytes** | All fixed structures combined |
 
 **Total static overhead per firmware image:** 196 bytes (ImageHeader 80 B + SignatureBlock 116 B)
+
+**Total metadata journal NOR usage:** 16 KB (Critical Copy A 4 KB + Critical Copy B 4 KB + Frequent ring 4 KB + OTA Progress 4 KB)

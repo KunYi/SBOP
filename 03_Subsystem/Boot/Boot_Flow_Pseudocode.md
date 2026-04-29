@@ -92,6 +92,21 @@ function sbop_boot() -> Never:
     let boot_slot = storage_get_boot_slot()
     assert(boot_slot == SLOT_A or boot_slot == SLOT_B, ERR-BOOT-STATE-001)
 
+    // Test/confirm check: if the selected slot is in TESTING state, the
+    // application from the previous boot did NOT call boot_set_confirmed().
+    // This means the image failed to prove itself healthy — immediate rollback,
+    // no N-attempt retry. Matches MCUboot's test/confirm model.
+    let boot_slot_status = storage_get_slot_status(boot_slot)
+    if boot_slot_status == TESTING:
+        // Application never confirmed — image is not healthy
+        error_log_write(SELECT_SLOT, ERR-BOOT-STATE-005)  // Unconfirmed image
+        storage_set_slot_status(boot_slot, INVALID)
+        // Fall through to fallback logic below
+    else if boot_slot_status != ACTIVE and boot_slot_status != FALLBACK
+         and boot_slot_status != VERIFIED and boot_slot_status != PENDING:
+        // Slot is in an unexpected state
+        return Err(ERR-BOOT-STATE-001)
+
     // ── Phase 3-9: Attempt to verify and boot the selected slot ──
     let result = boot_verify_and_execute_slot(boot_slot)
 
@@ -118,8 +133,9 @@ function sbop_boot() -> Never:
         IWDG_REFRESH()
         storage_set_boot_slot(fallback_slot)
         IWDG_REFRESH()
-        metadata_set_boot_attempt_count(0)
-        metadata_set_prev_boot_phase(0x00)
+        // Frequent journal reset: erase ring buffer to start fresh for fallback slot.
+        // Critical journal is untouched — slot state transition handled above.
+        frequent_journal_erase()
 
         let fallback_result = boot_verify_and_execute_slot(fallback_slot)
         if fallback_result == OK:
@@ -249,6 +265,17 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
     // FIH redundant compare
     let hash_match_v2 = constant_time_compare(computed_hash, header.hash, 32)
     if hash_match_v2 != true: return Err(ERR-BOOT-CRYPTO-002)
+
+    // IV reuse detection: check if this (KD, IV_dev) pair was used before.
+    // Reads last_iv_hash from frequent journal (ring buffer, no sector erase).
+    // If the truncated hash matches, the same keystream was used twice —
+    // possible AES-CTR replay attack.
+    let last_record = frequent_journal_read_last()
+    if last_record.valid:
+        let current_iv = storage_read_iv(slot)
+        let current_iv_hash = sha256(current_iv || KD[0..16])
+        if constant_time_compare(current_iv_hash[0..24], last_record.last_iv_hash, 24):
+            return Err(ERR-BOOT-CRYPTO-007)  // IV reuse detected
     IWDG_REFRESH()
 
     // ── Phase 7: Check Version ──
@@ -271,10 +298,14 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
         let write_ok = storage_write_version_counter(header.firmware_version)
         if write_ok != true: return Err(ERR-STOR-WRITE-001)
 
-    // ── Phase 9: Mark Slot Active ──
-    state = MARK_ACTIVE
+    // ── Phase 9: Mark Slot Testing (test/confirm model) ──
+    // New images enter TESTING state, not ACTIVE. The application must call
+    // boot_set_confirmed() to promote to ACTIVE. If the device resets before
+    // confirmation, the bootloader immediately reverts to the fallback slot —
+    // no N-attempt retry, no boot_attempt_count accumulation.
+    state = MARK_TESTING
     IWDG_REFRESH()
-    let mark_ok = storage_set_slot_status(slot, ACTIVE)
+    let mark_ok = storage_set_slot_status(slot, TESTING)
     if mark_ok != true: return Err(ERR-STOR-WRITE-001)
 
     // ── Phase 10: Lock Boot ──
@@ -288,11 +319,23 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
     let entry_point = payload.entry_point()
     if entry_point == null: return Err(ERR-BOOT-PARSE-007)
 
-    // Mark that we reached EXECUTE (for boot health tracking)
-    metadata_set_prev_boot_phase(0x01)
+    // Record this boot in the frequent journal (ring buffer, no sector erase).
+    // prev_boot_phase=0x01 (reached EXECUTE), flags encode TESTING/FALLBACK state.
+    // Also records IV hash for reuse detection and extends the measured boot PCR chain.
+    // Critical journal is NOT written here — slot state unchanged.
+    let boot_flags = 0x00
+    if storage_get_slot_status(slot) == TESTING: boot_flags |= 0x01  // was_testing
+    if storage_get_slot_status(slot) == FALLBACK: boot_flags |= 0x02 // was_fallback
+    let iv_hash = sha256(current_iv || KD[0..16])
 
-    // Update boot metrics
-    boot_metrics_increment()
+    // Measured boot: extend PCR chain for remote attestation.
+    // PCR[n] = SHA-256(PCR[n-1] || image_hash || slot || boot_phase)
+    // If no previous record exists (first boot), compute initial PCR.
+    let last_record = frequent_journal_read_last()
+    let prev_pcr = last_record.valid ? last_record.pcr_value : measured_boot_initial_pcr()
+    let new_pcr = sha256(prev_pcr || header.hash || slot as u8 || 0x01)
+
+    frequent_journal_append(0x01, boot_flags, iv_hash[0..24], new_pcr)
 
     // RTC->BKP3R already holds the original RCC->CSR value (captured before
     // HAL_Init cleared it in Pass 1 INIT). It survives this system reset, so
@@ -315,7 +358,69 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
 
 ---
 
-## 3. Fail-Safe Handler
+## 3. Application Confirm API
+
+```
+/// Called by the application after it has verified its own health.
+/// Must be called before the next reset — typically early in application init,
+/// after self-test, sensor check, and network connectivity are confirmed.
+/// If not called before the next reset, the bootloader immediately reverts
+/// to the fallback slot (test/confirm model — no N-attempt retry).
+function boot_set_confirmed() -> Result<(), BootError>:
+    // Only the active application image can confirm itself.
+    // This is NOT a bootloader-phase function — it's called from Zone 2 (app).
+    // Requires the application to have boot API access (SVC or direct call
+    // before MPU lockdown).
+
+    let active_slot = metadata_read_active_slot()
+    let slot_status  = storage_get_slot_status(active_slot)
+
+    if slot_status != TESTING:
+        return Err(ERR-BOOT-STATE-006)  // Not in testing state — already confirmed?
+
+    // Atomically transition TESTING → ACTIVE in critical journal.
+    // This triggers a critical journal write (two-copy atomic, sector erase).
+    // Infrequent operation — only once per successful OTA update.
+    storage_set_slot_status(active_slot, ACTIVE)
+
+    // Record confirmation in frequent journal (ring buffer append, no erase).
+    // Uses current IV hash from the most recent boot record.
+    let last_record = frequent_journal_read_last()
+    let iv_hash = last_record.valid ? last_record.last_iv_hash : [0u8; 24]
+    // Use current PCR (no new extend — confirmation doesn't change measurement)
+    frequent_journal_append(0x02, 0x00, iv_hash, last_record.pcr_value)  // 0x02 = confirmed
+
+    return OK
+```
+
+**Calling convention:** The application binary exports `boot_set_confirmed` as a weak symbol.
+The bootloader provides a default implementation (SVC-based metadata write). The application
+calls it once during early init, after health checks pass:
+
+```c
+// Application main.c — early init
+int main(void) {
+    hal_init();
+    if (self_test_pass() && sensors_ok() && network_ready()) {
+        boot_set_confirmed();  // Promote TESTING → ACTIVE
+    }
+    // ... normal application code ...
+}
+```
+
+**Failure scenarios:**
+
+| Scenario | Slot status before boot | Action |
+|---|---|---|
+| App confirms, then reboots normally | TESTING → boot_set_confirmed() → ACTIVE | Boot as ACTIVE |
+| App crashes before confirming | TESTING (unconfirmed) | Immediate rollback to fallback |
+| App confirms, new OTA arrives | ACTIVE → FALLBACK | Old confirmed image becomes fallback |
+| Power loss before confirm | TESTING (unconfirmed) | Immediate rollback — no retry |
+| App confirms twice | ACTIVE (already confirmed) | Returns ERR-BOOT-STATE-006 |
+
+---
+
+## 4. Fail-Safe Handler
 
 ```
 function handle_boot_error(error: BootError) -> Never:
@@ -335,45 +440,116 @@ function handle_boot_error(error: BootError) -> Never:
     // Zeroize any sensitive data in RAM
     secure_zeroize_boot_workspace()
     
-    // Enter infinite wait for external recovery.
+    // Enter Serial Recovery Protocol (SRP) event loop.
+    // SRP handles PING, AUTH_CHALLENGE, AUTH_RESPONSE, QUERY_STATUS,
+    // UPLOAD_FIRMWARE, ERASE_SLOT, RESET_DEVICE, GET_ERROR_LOG.
     // IWDG is still active — must refresh to prevent 800 ms reset.
+    // SRP frames are processed on USART1 (PA9/PA10).
+    // See Serial_Recovery_Protocol.md for full protocol specification.
     loop:
         IWDG_REFRESH()
         
-        // Optionally: listen for recovery command on minimal interface
-        if recovery_interface_data_available():
-            let cmd = recovery_interface_read()
-            if cmd.type == RECOVERY_OTA_INITIATE:
-                IWDG_REFRESH()
-                enter_recovery_boot()
+        // Send FAILSAFE beacon every 500 ms (rate-limited inside srp_beacon_send)
+        srp_beacon_send(error.code, boot_slot, fallback_slot)
         
-        platform_idle()  // Low-power wait
+        // Process incoming SRP frames with 100 ms timeout
+        if srp_frame_available(timeout_ms = 100):
+            IWDG_REFRESH()
+            srp_process_frame()
+        
+        // If recovery upload completes and device is reset via SRP RESET_DEVICE,
+        // this loop never returns to the next iteration.
+        
+        platform_idle()  // WFI — USART1 RX interrupt wakes
 ```
 
 ---
 
-## 4. Recovery Boot
+## 5. SRP Recovery Boot
+
+The Serial Recovery Protocol (see `Serial_Recovery_Protocol.md`) runs within the FAILSAFE handler. It provides authenticated firmware upload, slot management, and device control over USART1. Key integration points:
 
 ```
-function enter_recovery_boot():
-    // Minimal boot for OTA recovery only
-    // Does NOT execute application firmware
-    
-    let recovery_slot = storage_get_fallback_slot()
-    if recovery_slot == SLOT_INVALID:
-        // No valid fallback; wait for full OTA
-        return
-    
-    // Attempt to boot the fallback slot
-    // (Reuses verification functions from main boot)
-    
-    let image_data = storage_read_slot(recovery_slot)
-    if verify_image_minimal(image_data) == OK:
-        storage_set_boot_slot(recovery_slot)
-        system_reset()  // Full reboot into recovery slot
-    else:
-        // Recovery failed; wait for external intervention
-        platform_signal_failsafe(ERR-BOOT-STATE-001)
+// SRP event processing (called from FAILSAFE loop):
+function srp_process_frame():
+    let frame = srp_frame_read()
+    if frame.crc_invalid:
+        return  // Discard silently — CRC-16 mismatch
+    if frame.sequence != expected_seq:
+        return  // Out-of-order — discard
+
+    expected_seq = (expected_seq + 1) & 0xFF
+
+    match frame.opcode:
+        case PING:
+            srp_send_response(PING, frame.payload)  // Echo
+
+        case GET_VERSION:
+            srp_send_response(GET_VERSION, build_version_payload())
+
+        case AUTH_CHALLENGE:
+            if srp_brute_force_locked_out():
+                srp_send_error(ERR-SRP-AUTH-003)
+                return
+            let challenge = crypto_random_bytes(32)
+            srp_auth_session.challenge = challenge
+            srp_send_response(AUTH_CHALLENGE, challenge || device_uid)
+
+        case AUTH_RESPONSE:
+            let hmac_host = frame.payload[0..32]
+            let access_level = frame.payload[33]
+            let expected = hmac_sha256(KD_Debug,
+                           srp_auth_session.challenge || 0x02)
+            if constant_time_compare(hmac_host, expected, 32):
+                srp_auth_session.authenticated = true
+                srp_auth_session.access_level = access_level
+                srp_auth_session.expires_at = rtc_get_seconds() + 300
+                srp_brute_force_reset()
+                srp_send_response(AUTH_RESPONSE, [access_level, 300])
+            else:
+                srp_brute_force_record_failure()
+                srp_send_error(ERR-ID-AUTH-001)
+
+        case QUERY_STATUS if auth_check():
+            srp_send_response(QUERY_STATUS, build_status_payload())
+
+        case UPLOAD_FIRMWARE if auth_check():
+            srp_handle_upload(frame)
+
+        case ERASE_SLOT if auth_check():
+            srp_handle_erase(frame)
+
+        case RESET_DEVICE if auth_check():
+            srp_handle_reset(frame)
+
+        case GET_ERROR_LOG if auth_check():
+            srp_handle_get_log(frame)
+
+        case _:
+            srp_send_error(ERR-SRP-CMD-001)
+
+function auth_check() -> bool:
+    if not srp_auth_session.authenticated:
+        srp_send_error(ERR-SRP-AUTH-001)
+        return false
+    if rtc_get_seconds() > srp_auth_session.expires_at:
+        srp_auth_session.authenticated = false
+        srp_send_error(ERR-SRP-AUTH-002)
+        return false
+    return true
+```
+
+**SRP boot flow integration:**
+
+```
+Boot fails (both slots dead)
+  └─→ boot_enter_failsafe(ERR-BOOT-STATE-004)
+        └─→ handle_boot_error()
+              └─→ FAILSAFE loop with SRP
+                    ├─→ Host connects, authenticates
+                    ├─→ Host uploads firmware via UPLOAD_FIRMWARE
+                    ├─→ Host sends RESET_DEVICE
+                    └─→ Device resets, boots new firmware
 ```
 
 ---
@@ -531,16 +707,16 @@ Application:
 | Phase | Maximum Allowed Time | Notes |
 | --- | --- | --- |
 | INIT (incl. IWDG start + NOR detect) | ~6 ms | Platform init + JEDEC ID read |
-| SELECT_SLOT | < 1 ms | Simple metadata read |
+| SELECT_SLOT | < 1 ms | Critical journal read (128 B) + frequent journal read (32 B) |
 | LOAD_IMAGE | < 100 ms | Depends on image size and flash speed |
 | PARSE_HEADER | < 1 ms | Fixed-size parse |
 | VERIFY_SIGNATURE | < 50 ms | Ed25519 verify |
-| VERIFY_INTEGRITY | < 100 ms | SHA-256 over payload |
+| VERIFY_INTEGRITY | < 100 ms | SHA-256 over payload + IV reuse check |
 | CHECK_VERSION | < 1 ms | Simple integer comparison |
-| COMMIT_VERSION | < 10 ms | Flash write |
-| MARK_ACTIVE | < 10 ms | Flash write |
-| LOCK_BOOT | < 1 ms | Memory protection enable |
-| EXECUTE (RTC magic + NVIC_SystemReset) | < 1 ms | IWDG stops on reset |
+| COMMIT_VERSION | < 10 ms | SR1 OTP write (new version only) |
+| MARK_TESTING | < 45 ms | Critical journal write (OTA events only) — sector erase + 128 B page program |
+| LOCK_BOOT | < 1 ms | Memory protection enable + BP bit set |
+| EXECUTE (incl. frequent journal append) | < 2 ms | Frequent journal 32 B page program (~0.7 ms) + RTC magic + NVIC_SystemReset |
 
 **Pass 2 (IWDG stopped, fast path to application):**
 
@@ -550,3 +726,222 @@ Application:
 | Jump to prepared application | ~3 ms | VTOR set, workspace clear, MSP+PC load |
 
 **Total boot budget target:** < 200 ms (Pass 1) + ~5 ms (Pass 2) ≈ < 205 ms from cold reset to firmware execution. Well under the 300 ms SBOP target.
+
+---
+
+## 11. Metadata Journal API
+
+The metadata journal is split into two tiers with different update frequencies and write protocols. The critical journal (slot state, version ceiling) uses two-copy atomic writes and is updated only on OTA/slot transitions. The frequent journal (per-boot counters, IV hash) uses a simple ring buffer append with no sector erase until the ring wraps.
+
+### 11.1 Critical Journal API
+
+```
+/// Read the authoritative copy of the critical journal.
+/// Determines active copy by comparing sequence numbers and CRC-32.
+/// Returns the critical metadata: active_slot, boot_target, re_encrypt_state,
+/// slot_a_info, slot_b_info, max_allowed_version.
+function critical_journal_read() -> CriticalMetadata:
+    let copy_a = nor_spi_read(0x20_0000, 128)
+    let copy_b = nor_spi_read(0x20_1000, 128)
+
+    let seq_a = copy_a[0..4] as u32
+    let seq_b = copy_b[0..4] as u32
+    let crc_a_ok = (crc32(copy_a[0..124]) == copy_a[124..128] as u32)
+    let crc_b_ok = (crc32(copy_b[0..124]) == copy_b[124..128] as u32)
+
+    if crc_a_ok and crc_b_ok:
+        if seq_a >= seq_b:
+            let was_committed = (seq_a & 1) == 0  // even = committed
+        else:
+            let was_committed = (seq_b & 1) == 0
+        if not was_committed:
+            // Odd sequence = power loss during write.
+            // Discard partial; use the other (previously committed) copy.
+            return (seq_a > seq_b) ? parse_metadata(copy_b) : parse_metadata(copy_a)
+        return (seq_a >= seq_b) ? parse_metadata(copy_a) : parse_metadata(copy_b)
+
+    if crc_a_ok: return parse_metadata(copy_a)
+    if crc_b_ok: return parse_metadata(copy_b)
+    // Neither valid — metadata destroyed
+    boot_enter_failsafe(ERR-STOR-READ-001)
+
+
+/// Atomically write the critical journal using the two-copy protocol.
+/// Only called on OTA/slot events — NOT every boot.
+function critical_journal_write(new_data: &CriticalMetadata):
+    let (active_offset, inactive_offset) = critical_journal_find_active()
+    let current_seq = nor_spi_read_u32(active_offset)
+
+    // Write to INACTIVE copy (separate 4 KB sector — safe to erase)
+    let new_seq = current_seq + 1  // odd = in-progress
+    new_data[0..4] = new_seq
+    new_data[124..128] = crc32(new_data[0..124])
+
+    nor_spi_erase_sector(inactive_offset)
+    nor_spi_page_program(inactive_offset, new_data, 128)
+
+    // Verify write integrity before commit
+    let verify = nor_spi_read(inactive_offset, 128)
+    assert(crc32(verify[0..124]) == verify[124..128] as u32, ERR-STOR-WRITE-001)
+
+    // Atomic commit: increment sequence to even
+    nor_spi_write_u32(inactive_offset, new_seq + 1)  // even = committed
+
+
+function critical_journal_find_active() -> (u32, u32):
+    let seq_a = nor_spi_read_u32(0x20_0000)
+    let seq_b = nor_spi_read_u32(0x20_1000)
+    if seq_a >= seq_b:
+        return (0x20_0000, 0x20_1000)  // (active, inactive)
+    else:
+        return (0x20_1000, 0x20_0000)
+```
+
+### 11.2 Frequent Journal API
+
+```
+/// Record size: 64 bytes. 64 records per 4 KB sector.
+/// Sector at 0x20_2000.
+const FREQUENT_JOURNAL_BASE: u32 = 0x20_2000
+const FREQUENT_RECORD_SIZE: u32 = 64
+const FREQUENT_SECTOR_SIZE: u32 = 4096
+const FREQUENT_MAX_RECORDS: u32 = 64
+
+struct FrequentRecord:
+    boot_seq:        u32    // [0]  Monotonic boot counter
+    prev_boot_phase: u8     // [4]  0x00=not reached EXECUTE, 0x01=EXECUTE, 0x02=confirmed
+    flags:           u8     // [5]  bit0=was_testing, bit1=was_fallback
+    reserved:        u8[2]  // [6]  Must be zero
+    last_iv_hash:    u8[24] // [8]  Truncated SHA-256(IV_dev || KD[0..16])
+    pcr_value:       u8[32] // [32] SHA-256 chained measurement (measured boot, see §11.3)
+    crc16:           u16    // [62] CRC-16-CCITT over bytes 0..61
+
+
+/// Append a new record to the frequent journal ring buffer.
+/// No sector erase unless the ring wraps (once per ~64 boots).
+/// Called once per successful boot in Phase 11 (EXECUTE).
+/// The PCR value is the chained measurement for remote attestation.
+function frequent_journal_append(phase: u8, flags: u8, iv_hash: &[u8; 24],
+                                 pcr_value: &[u8; 32]):
+    let last = frequent_journal_read_last()
+    let new_seq = (last.valid) ? last.boot_seq + 1 : 1
+
+    let write_off = frequent_journal_find_next_free()
+    if write_off >= FREQUENT_SECTOR_SIZE:
+        // Ring full — erase and restart from beginning
+        nor_spi_write_enable()
+        nor_spi_erase_sector(FREQUENT_JOURNAL_BASE)
+        nor_spi_wait_busy()
+        write_off = 0
+
+    // Build record (CRC-16 over bytes 0..61)
+    let mut record = [0u8; 64]
+    record[0..4]   = new_seq as u32
+    record[4]      = phase
+    record[5]      = flags
+    record[6..8]   = [0u8, 0u8]
+    record[8..32]  = iv_hash[0..24]
+    record[32..64] = pcr_value[0..32]
+    let crc = crc16_ccitt(record[0..62])
+    record[62..64] = crc as u16
+
+    nor_spi_page_program(FREQUENT_JOURNAL_BASE + write_off, record, 64)
+
+    // Verify
+    let verify = nor_spi_read(FREQUENT_JOURNAL_BASE + write_off, 64)
+    assert(memcmp(record, verify, 64) == 0, ERR-STOR-WRITE-001)
+
+
+/// Read the most recent valid record from the frequent journal.
+/// Scans backward from end of sector for first non-erased record with valid CRC-16.
+function frequent_journal_read_last() -> Option<FrequentRecord>:
+    for off in (FREQUENT_SECTOR_SIZE - FREQUENT_RECORD_SIZE) down to 0
+             step FREQUENT_RECORD_SIZE:
+        let data = nor_spi_read(FREQUENT_JOURNAL_BASE + off, 64)
+        if data[0..4] != 0xFFFFFFFF:  // Not erased
+            if crc16_ccitt(data[0..62]) == data[62..64] as u16:
+                return Some(FrequentRecord{
+                    boot_seq:        data[0..4] as u32,
+                    prev_boot_phase: data[4],
+                    flags:           data[5],
+                    last_iv_hash:    data[8..32],
+                    pcr_value:       data[32..64],
+                })
+    return None  // Sector empty or all corrupt
+
+
+/// Find the next free record slot (first erased 64-byte aligned offset).
+function frequent_journal_find_next_free() -> u32:
+    for off in 0..FREQUENT_SECTOR_SIZE step FREQUENT_RECORD_SIZE:
+        let header = nor_spi_read(FREQUENT_JOURNAL_BASE + off, 4)
+        if header == 0xFFFFFFFF:
+            return off
+    return FREQUENT_SECTOR_SIZE  // Sector full
+
+
+/// Erase the frequent journal sector (called on slot fallback to start fresh).
+function frequent_journal_erase():
+    nor_spi_write_enable()
+    nor_spi_erase_sector(FREQUENT_JOURNAL_BASE)
+    nor_spi_wait_busy()
+```
+
+### 11.3 Measured Boot PCR Chain
+
+```
+/// Compute the initial PCR value for the measured boot chain.
+/// PCR[0] = SHA-256("SBOP_MEASURED_BOOT_V1" || bootloader_version || device_uid)
+/// This is deterministic — given the same bootloader version and device UID,
+/// the initial PCR is always the same. It can be recomputed by the verifier.
+function measured_boot_initial_pcr() -> [u8; 32]:
+    let device_id = identity_get_device_id()
+    let input = "SBOP_MEASURED_BOOT_V1" || BOOTLOADER_VERSION as u32 || device_id.uid
+    return sha256(input)
+
+
+/// Extend the PCR chain with a new boot event.
+/// PCR[n] = SHA-256(PCR[n-1] || image_hash || slot || boot_phase)
+/// Called in Phase 11 before frequent_journal_append().
+function measured_boot_extend(prev_pcr: &[u8; 32], image_hash: &[u8; 32],
+                              slot: SlotID, boot_phase: u8) -> [u8; 32]:
+    let mut input = [0u8; 32 + 32 + 1 + 1]  // 66 bytes
+    input[0..32]   = prev_pcr
+    input[32..64]  = image_hash
+    input[64]      = slot as u8
+    input[65]      = boot_phase
+    return sha256(input)
+
+
+/// Attestation verification (performed by remote verifier):
+///
+///   let pcr = SHA-256("SBOP_MEASURED_BOOT_V1" || bl_version || device_uid)
+///   for each record in measurement_log:
+///       pcr = SHA-256(pcr || record.image_hash || record.slot || record.boot_phase)
+///   assert(pcr == device.current_pcr_value)
+///
+/// Any modification to a measurement record changes its pcr_value, which
+/// breaks the chain for all subsequent records. The verifier detects this
+/// by recomputing the chain from the initial PCR.
+```
+
+### 11.3 Journal Write Triggers
+
+| Event | Critical Journal | Frequent Journal |
+|-------|-----------------|-----------------|
+| Normal boot (Phase 11 EXECUTE) | **Not written** | `append(0x01, flags, iv_hash, pcr)` |
+| OTA writes new image to slot | Write (slot status → PENDING) | Not written |
+| First boot after OTA (Phase 9) | Write (slot status → TESTING) | Not written |
+| `boot_set_confirmed()` | Write (slot status → ACTIVE) | `append(0x02, 0x00, iv_hash)` |
+| Slot verification fails | Write (slot status → INVALID) | Not written |
+| Slot fallback (SELECT_SLOT) | Write (boot_target, active_slot) | `erase()` (fresh start for fallback slot) |
+| OTA updates version ceiling | Write (max_allowed_version) | Not written |
+
+**Write amplification comparison:**
+
+| Journal | Erases per year (daily boot, weekly OTA) | Erases per year (hourly boot, daily OTA) |
+|---------|------------------------------------------|----------------------------------------|
+| Single journal (old) | 365 | 8,760 |
+| Critical journal (new) | ~52 (OTA events only) | ~365 (OTA events only) |
+| Frequent journal (new) | ~3 (128 boots/erase) | ~69 (128 boots/erase) |
+| **Total (new)** | **~55** | **~434** |
+| **Reduction vs old** | **85%** | **95%** |

@@ -39,10 +39,16 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 | 3 | `boot_set_pending_image` | `(SlotID) → Result<(), BootError>` | F | < 10 ms | §3.3 |
 | 4 | `boot_enter_failsafe` | `(BootError) → Never` | S | < 1 ms to enter | §3.4 |
 | 5 | `boot_lock` | `() → Result<(), BootError>` | F, S | < 1 ms | §3.5 |
+| 6 | `boot_get_measurement_log` | `() → Result<FrequentRecord[], BootError>` | F | < 5 ms | §3.6 |
 
 **State machine context:** Boot APIs are valid only during boot phases (INIT through EXECUTE). After `boot_lock`, no further boot-time modifications are possible.
 
 **Error domain:** ERR-BOOT-CRYPTO-xxx, ERR-BOOT-PARSE-xxx, ERR-BOOT-STATE-xxx, ERR-BOOT-VERSION-xxx
+
+→ Implementation: `Boot/Boot_Flow_Pseudocode.md`
+→ State detail: `Boot/Boot_State_Detail.md`
+→ Failure model: `Boot/Boot_Failure_Model.md`
+→ Measured boot: `Boot/Boot_Flow_Pseudocode.md` §11.3
 
 → Implementation: `Boot/Boot_Flow_Pseudocode.md`
 → State detail: `Boot/Boot_State_Detail.md`
@@ -123,6 +129,28 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 ---
 
+### 3.6 Serial Recovery Protocol (SRP)
+
+| # | Command | Opcode | Auth Req | Category | Notes |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `PING` | 0x00 | No | F | Heartbeat/liveness. Echoes payload. |
+| 2 | `AUTH_CHALLENGE` | 0x01 | No | F, SEC | Begin authentication. Returns 32 B challenge + device UID. |
+| 3 | `AUTH_RESPONSE` | 0x02 | No | F, SEC | HMAC-SHA-256(KD_Debug, challenge \|\| 0x02). 3 failures → lockout. |
+| 4 | `QUERY_STATUS` | 0x10 | Yes | F | Device identity, slot status, FAILSAFE reason. |
+| 5 | `UPLOAD_FIRMWARE` | 0x11 | Yes | F, S | Fragmented firmware upload. 2044 B max chunk. Supports resume. |
+| 6 | `ERASE_SLOT` | 0x12 | Yes | F, S | Erase a slot. Requires 0xA5 confirmation byte. |
+| 7 | `RESET_DEVICE` | 0x13 | Yes | F | Trigger system reset. Requires 0xA5 confirmation byte. |
+| 8 | `GET_ERROR_LOG` | 0x14 | Yes | F | Retrieve error log entries. |
+| 9 | `GET_VERSION` | 0x15 | No | F | Protocol version, SBOP version, board ID. |
+
+**Error domain:** ERR-SRP-AUTH-xxx, ERR-SRP-FRAME-xxx, ERR-SRP-CMD-xxx
+
+→ Protocol specification: `Boot/Serial_Recovery_Protocol.md`
+→ Recovery boot flow: `Boot/Boot_Flow_Pseudocode.md` §5
+→ Debug auth key: `../02_System_Design/Key_Hierarchy.md`
+
+---
+
 ## 4. Cross-Cutting Contracts
 
 ### 4.1 Timing Summary
@@ -148,7 +176,8 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 | Identity (PROV + AUTH + IDENT + KEY + ATST + CLONE) | ERR-ID-xxx-001..099 | 14 |
 | Storage | ERR-STOR-xxx-001..099 | 4 |
 | Hardware | ERR-HW-xxx-001..099 | 7 |
-| **Total** | | **72** |
+| SRP (AUTH + FRAME + CMD) | ERR-SRP-xxx-001..099 | 8 |
+| **Total** | | **80** |
 
 → Full catalog: `../02_System_Design/Error_Code_Catalog.md`
 
