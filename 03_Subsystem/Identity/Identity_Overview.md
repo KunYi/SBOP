@@ -1,9 +1,9 @@
 # SBOP Identity Subsystem Specification
 
 **Document ID:** SUB-ID-OV-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -39,9 +39,9 @@ Each device possesses a unique cryptographic identity:
 | --- | --- | --- | --- |
 | UID | TRNG at provisioning | 128 bits | Unique device identifier |
 | KD | HKDF(KR, UID) | 256 bits | Device master key |
-| KD_Auth | HKDF(KD, "AUTH") | 256 bits | OTA mutual TLS |
-| KD_Debug | HKDF(KD, "DEBUG") | 256 bits | Debug authentication |
-| KD_Storage | HKDF(KD, "STORAGE") | 256 bits | Flash encryption (optional) |
+| KD_Auth | HKDF(KD, "SBOP-AUTH-v1") | 256 bits | OTA mutual TLS |
+| KD_Debug | HKDF(KD, "SBOP-DEBUG-v1") | 256 bits | Debug authentication |
+| KD_Storage | HKDF(KD, "SBOP-STORAGE-v1") | 256 bits | Flash encryption (optional) |
 
 ### 3.2 Identity Binding Options
 

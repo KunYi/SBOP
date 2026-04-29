@@ -1,7 +1,7 @@
 # Boot Flow Pseudocode Specification
 
 **Document ID:** SUB-BOOT-FLOW-001
-**Version:** 2.1
+**Version:** 2.2
 **Status:** Draft
 **Last Review:** 2026-04-29
 
@@ -133,9 +133,13 @@ function sbop_boot() -> Never:
         IWDG_REFRESH()
         storage_set_boot_slot(fallback_slot)
         IWDG_REFRESH()
-        // Frequent journal reset: erase ring buffer to start fresh for fallback slot.
+        // Frequent journal: write fallback marker instead of erasing.
+        // Erasing the sector destroys boot history useful for diagnosing
+        // why the primary slot failed. A marker record (phase=0xFF) preserves
+        // the history while marking the transition. The ring buffer wraps
+        // naturally when full (~64 records per 4 KB sector).
         // Critical journal is untouched — slot state transition handled above.
-        frequent_journal_erase()
+        frequent_journal_append(0xFF, 0x00, &[0u8; 24], &[0u8; 32])
 
         let fallback_result = boot_verify_and_execute_slot(fallback_slot)
         if fallback_result == OK:
@@ -171,13 +175,85 @@ function jump_to_prepared_application() -> Never:
     assert(reset_pc >= AXI_SRAM_BASE, ERR-BOOT-PARSE-007)
     assert(reset_pc < AXI_SRAM_BASE + AXI_SRAM_SIZE, ERR-BOOT-PARSE-007)
 
+    // Invalidate I-Cache before jumping to AXI SRAM.
+    // Pass 1 ran from internal flash with I-Cache enabled — stale flash
+    // instructions may alias to AXI SRAM addresses. ICIALLU flushes the
+    // entire I-Cache; DSB+ISB drain the pipeline so subsequent fetches
+    // hit AXI SRAM directly.
+    SCB->ICIALLU = 0
+    __DSB()
+    __ISB()
+
+    // ── Peripheral deinit: restore reset-like state ──
+    // The application must see clean peripherals, not bootloader leftovers.
+    // Leaving SPI enabled with pending flags, GPIO alt-functions configured,
+    // or peripheral clocks running can cause phantom interrupts or pin
+    // conflicts in the application.
+    //
+    // NVIC: disable all IRQs, clear all pending bits.
+    for i in 0..8: NVIC->ICER[i] = 0xFFFFFFFF
+    for i in 0..8: NVIC->ICPR[i] = 0xFFFFFFFF
+    //
+    // SPI1: disable, reset CR1/CR2 to power-on defaults.
+    SPI1->CR1 = 0
+    SPI1->CR2 = 0
+    //
+    // USART1: disable, clear control registers (if used for SRP).
+    USART1->CR1 = 0
+    USART1->CR2 = 0
+    USART1->CR3 = 0
+    //
+    // GPIO: return all bootloader-used pins to analog input (reset state).
+    //   SPI1:  PA5 (SCK), PA6 (MISO), PA7 (MOSI), PA4 (NSS)
+    //   USART1: PA9 (TX), PA10 (RX)
+    //   NOR control: PB0 (HOLD), PB1 (WP)
+    // Analog mode (MODER=0b11) is the safest post-boot pin state:
+    // lowest power, no driven output, no phantom edge interrupts.
+    gpio_deinit_pin(GPIOA, 4)   // NSS
+    gpio_deinit_pin(GPIOA, 5)   // SCK
+    gpio_deinit_pin(GPIOA, 6)   // MISO
+    gpio_deinit_pin(GPIOA, 7)   // MOSI
+    gpio_deinit_pin(GPIOA, 9)   // TX
+    gpio_deinit_pin(GPIOA, 10)  // RX
+    gpio_deinit_pin(GPIOB, 0)   // HOLD
+    gpio_deinit_pin(GPIOB, 1)   // WP
+    //
+    // CRYP + HASH: disable to clear internal state (key material).
+    if CRYP->CR & CRYP_CR_EN: CRYP->CR &= ~CRYP_CR_EN
+    if HASH->CR & HASH_CR_INIT: HASH->CR &= ~HASH_CR_INIT
+    //
+    // RTC: disable interrupts and clear pending flags.
+    // The bootloader enabled RCC_BDCR_RTCEN to access backup registers
+    // (BKP0R for two-pass magic, BKP1R for AXI CRC, BKP3R for reset cause).
+    // Backup register VALUES are preserved — the application needs BKP3R.
+    RTC->CR   &= ~(RTC_CR_ALRAIE | RTC_CR_WUTIE | RTC_CR_TSIE | RTC_CR_TAMPIE)
+    RTC->ISR  &= ~(RTC_ISR_ALRAF | RTC_ISR_WUTF  | RTC_ISR_TSF  | RTC_ISR_TAMPF)
+    RTC->WPR   = 0x00  // Disable write protection (return to reset state)
+    //
+    // RCC: disable peripheral clocks for deinitialized modules.
+    // AHB/APB clock enable bits — clear what the bootloader set.
+    // Leave RTCEN in BDCR set so the application can read BKP3R without
+    // re-enabling the RTC clock first (reduces application burden).
+    RCC->AHB1ENR  &= ~(RCC_AHB1ENR_CRCEN)
+    RCC->APB1LENR &= ~(RCC_APB1LENR_SPI2EN | RCC_APB1LENR_USART2EN)
+    RCC->APB2ENR  &= ~(RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN)
+    //
+    // CRITICAL: do NOT reset the system clock (HSE/PLL/sysclk). The
+    // application is already loaded into AXI SRAM and expects the CPU
+    // to be running. Clock reset would halt execution.
+
     // Set VTOR to application's vector table in AXI SRAM
     SCB->VTOR = AXI_SRAM_BASE
 
     // Clear bootloader state from DTCM + SRAM1/2
     secure_zeroize_boot_workspace()
 
-    // Jump to application — never returns
+    // Jump to application — never returns.
+    // MUST use a branch (BX), NOT a call (BLX). A call pushes the return
+    // address onto the application's stack, corrupting the initial SP slot
+    // and leaking a bootloader address into application-visible memory.
+    // The containing function is marked #[noreturn] so the compiler emits
+    // a tail branch, not a branch-with-link.
     // (inline assembly: msr msp, initial_sp; bx reset_pc)
     platform_jump_to_firmware(initial_sp, reset_pc)
 ```
@@ -381,6 +457,18 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
 
         // Write SignatureBlock to slot
         storage_write(slot, 80 + re_encrypted_payload.len + 16, serialize_sig_block(sig_block))
+
+        // ── Step 7b: Verify slot write before zeroizing keys ──
+        // If the NOR write silently failed (e.g., write-protect glitch, VDD droop,
+        // flash cell defect), zeroizing the keys would make recovery impossible —
+        // the plaintext is gone and the slot is corrupt.
+        // Read back the header and verify its HMAC to confirm the write landed.
+        let written_header_raw = storage_read(slot, 0, 80)
+        if written_header_raw == null: return Err(ERR-STOR-READ-001)
+        let written_hmac = crypto_hmac_sha256(KD, written_header_raw[0..56])[0..16]
+        if memcmp(written_hmac, written_header_raw[56..72], 16) != 0:
+            // Slot write did not land — do NOT zeroize keys; retry possible
+            return Err(ERR-STOR-WRITE-001)
 
         // ── Step 8: Zeroize sensitive key material ──
         secure_zeroize(shared_secret)
@@ -950,7 +1038,7 @@ Application:
 | Phase | Maximum Allowed Time | Notes |
 | --- | --- | --- |
 | INIT (detect RTC magic) | ~2 ms | Platform init (minimal) |
-| Jump to prepared application | ~3 ms | VTOR set, workspace clear, MSP+PC load |
+| Jump to prepared application | ~5 ms | I-Cache invalidate, NVIC clear, peripheral deinit (SPI, USART, GPIO, CRYP, HASH, RCC), VTOR set, workspace clear, MSP+PC load via BX |
 
 **Total boot budget target (non-OTA):** < 200 ms (Pass 1) + ~5 ms (Pass 2) ≈ < 205 ms from cold reset to firmware execution.
 **Total boot budget target (OTA first boot):** < 400 ms (Pass 1 with Phase 4.5 ECDH + GCM decrypt + KD_Storage re-encrypt) + ~5 ms (Pass 2) ≈ < 405 ms.
@@ -1109,7 +1197,8 @@ function frequent_journal_find_next_free() -> u32:
     return FREQUENT_SECTOR_SIZE  // Sector full
 
 
-/// Erase the frequent journal sector (called on slot fallback to start fresh).
+/// Erase the frequent journal sector (called when ring buffer wraps, not on fallback).
+/// Fallback uses a marker record (phase=0xFF) to preserve diagnostic history.
 function frequent_journal_erase():
     nor_spi_write_enable()
     nor_spi_erase_sector(FREQUENT_JOURNAL_BASE)
@@ -1164,7 +1253,7 @@ function measured_boot_extend(prev_pcr: &[u8; 32], image_hash: &[u8; 32],
 | First boot after OTA (Phase 9) | Write (slot status → TESTING) | Not written |
 | `boot_set_confirmed()` | Write (slot status → ACTIVE) | `append(0x02, 0x00, iv_hash)` |
 | Slot verification fails | Write (slot status → INVALID) | Not written |
-| Slot fallback (SELECT_SLOT) | Write (boot_target, active_slot) | `erase()` (fresh start for fallback slot) |
+| Slot fallback (SELECT_SLOT) | Write (boot_target, active_slot) | `append(0xFF, 0x00, zero_iv)` (marker — preserves history) |
 | OTA updates version ceiling | Write (max_allowed_version) | Not written |
 
 **Write amplification comparison:**

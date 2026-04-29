@@ -1,7 +1,7 @@
 # STM32H750VBT Secure Boot Platform Evaluation
 
 **Document ID:** PRD-EVAL-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
 **Last Review:** 2026-04-29
 **Owner:** Platform Evaluation Team
@@ -310,7 +310,7 @@ Backend (once per firmware version, all devices share same ciphertext):
   e            = CSPRNG(32 bytes)                             ← Ephemeral X25519 scalar
   E            = e * G                                        ← Ephemeral public key (32 B, sent to device)
   S            = X25519(e, OTA_public[key_index])              ← ECDH shared secret
-  K_s          = HKDF-SHA-256(S, "SBOP-OTA-ENC")              ← AES session key (32 B)
+  K_s          = HKDF-SHA-256(S, "SBOP-OTA-v1")              ← AES session key (32 B)
   iv           = CSPRNG(16 bytes)                             ← Random IV
   encrypted    = AES-256-CTR(K_s, iv, Payload)                ← Encrypt Payload only
 
@@ -348,7 +348,7 @@ Bootloader (Zone 1, Phase 5 — first boot after OTA):
   // ECDH + decrypt
   E  = image_data[80..112]                                   // Ephemeral public key (32 B)
   S  = X25519(OTA_private[enc_key_index], E)                 // ECDH shared secret
-  K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC")                     // AES session key
+  K_s = HKDF-SHA-256(S, "SBOP-OTA-v1")                     // AES session key
   Payload = AES-256-CTR_decrypt(K_s, iv, encrypted)          // → AXI SRAM (volatile only)
   secure_zeroize(S, 32); secure_zeroize(K_s, 32)             // Session secret no longer needed
 
@@ -459,11 +459,33 @@ Phase 11 (EXECUTE):
   1. Verify application image hash (already done in Phase 6)
   2. Copy payload from NOR slot to AXI SRAM base (0x2400_0000)
   3. Verify copy: SHA-256(AXI_SRAM[0..image_size]) == expected_hash
-  4. Set vector table offset register (VTOR) = 0x2400_0000
-  5. Clear all bootloader state from SRAM1/2/3 (zeroize KD, derived keys, SPI buffers)
-  6. Set MSP = AXI_SRAM[0]  (initial stack pointer from vector table)
-  7. Set PC = AXI_SRAM[4]   (reset handler from vector table)
-  8. Branch to application — bootloader is terminated
+  4. Invalidate I-Cache (SCB->ICIALLU = 0; DSB; ISB)
+     I-Cache may hold stale instructions from internal flash that alias
+     to AXI SRAM addresses. Must flush before executing from SRAM.
+  5. Peripheral deinit — restore reset-like state:
+     a. NVIC: disable all IRQs (ICER), clear all pending (ICPR)
+     b. SPI1: disable, CR1/CR2 = 0 (power-on defaults)
+     c. USART1: disable, CR1/CR2/CR3 = 0 (if used for SRP)
+     d. GPIO: return SPI1 pins (PA5/PA6/PA7/PA4), USART1 pins (PA9/PA10),
+        and NOR control pins (PB0/PB1) to analog input mode (MODER=0b11).
+        Analog is the safest reset state: no driven output, lowest power,
+        no phantom edge interrupts.
+     e. CRYP + HASH: disable to clear internal state (key material in CRYP).
+     f. RTC: disable interrupts (CR: ALRAIE, WUTIE, TSIE, TAMPIE), clear
+        pending flags (ISR: ALRAF, WUTF, TSF, TAMPF), disable write protect
+        (WPR = 0x00). Backup register values (BKP0R–BKP3R) are preserved —
+        the application reads BKP3R for reset cause.
+     g. RCC: disable peripheral clocks (SPI1, USART1 in APB2ENR; CRC in AHB1ENR).
+        Do NOT reset system clock — application expects CPU running.
+        Leave RTCEN in BDCR set — avoids forcing the application to re-enable.
+  6. Set vector table offset register (VTOR) = 0x2400_0000
+  7. Clear all bootloader state from SRAM1/2/3 (zeroize KD, derived keys, SPI buffers)
+  8. Set MSP = AXI_SRAM[0]  (initial stack pointer from vector table)
+  9. Set PC = AXI_SRAM[4]   (reset handler from vector table)
+  10. Branch to application — bootloader is terminated
+      MUST use BX (branch), NOT BLX (call). A call pushes LR onto the
+      application stack, corrupting the initial SP value and leaking a
+      bootloader return address into application memory.
 ```
 
 **Slot size justification (1 MB each):**
@@ -1206,7 +1228,7 @@ key_index = active OTA key pair slot (0..3, backend HSM selects)
 e           = CSPRNG(32 bytes)                                   ← Ephemeral X25519 scalar
 E           = e * G                                              ← Ephemeral public key (32 B, sent to device)
 S           = X25519(e, OTA_public[key_index])                    ← ECDH shared secret
-K_s         = HKDF-SHA-256(S, "SBOP-OTA-ENC", 32)                ← AES-256 session key
+K_s         = HKDF-SHA-256(S, "SBOP-OTA-v1", 32)                ← AES-256 session key
 iv          = CSPRNG(16 bytes)                                   ← Random IV
 encrypted_payload = AES-256-CTR(K_s, iv, Payload)
 
@@ -1430,7 +1452,7 @@ function sbop_boot():
 
         // X25519 ECDH: S = private * E = private * e * G
         S = X25519(OTA_private, E)                             // ECDH shared secret (32 B)
-        K_s = HKDF_SHA256(S, "SBOP-OTA-ENC", 32)               // AES-256 session key
+        K_s = HKDF_SHA256(S, "SBOP-OTA-v1", 32)               // AES-256 session key
         secure_zeroize(S, 32)                                   // Shared secret no longer needed
 
         // AES-256-CTR decrypt → AXI SRAM (volatile only)
@@ -1574,7 +1596,7 @@ function sbop_boot():
 ```
 Before re-encrypt (first boot after OTA):
   NOR: ImageHeader(80B) || E(32B) || iv(16B) || AES-CTR(K_s, iv, Payload) || InnerSigBlock(116B)
-  K_s = HKDF-SHA-256(X25519(OTA_private[i], E), "SBOP-OTA-ENC")
+  K_s = HKDF-SHA-256(X25519(OTA_private[i], E), "SBOP-OTA-v1")
   → OTA_private[i] must be available in Zone 1 (PC-ROP protected)
   → E is plaintext in NOR (ephemeral public key, public info)
   → Encrypted portion: ~512 KB; free space (upper 512 KB): erased (0xFF)
@@ -1654,7 +1676,7 @@ Device (Zone 2: OTA Library)                    Device (Zone 1: Bootloader)
               ║ 3. SHA-256(pub) == SR2.ota_fp[idx] (OTP)     ║  ← OTA key auth
               ║ 4. Check SR2.ota_revocation[idx] == 1         ║  ← Key not revoked
               ║ 5. S = X25519(OTA_private[idx], E)            ║  ← ECDH shared secret
-              ║ 6. K_s = HKDF(S, "SBOP-OTA-ENC")              ║
+              ║ 6. K_s = HKDF(S, "SBOP-OTA-v1")              ║
               ║ 7. AES-CTR decrypt with K_s → AXI SRAM         ║  ← Plaintext only in RAM
               ║ 8. zeroize(S), zeroize(K_s)                   ║
               ║ 9. Parse InnerSigBlock → sig_key_index,       ║
@@ -1695,7 +1717,7 @@ OTA_KEY_PAIR[0..3] = 4 X25519 key pairs (same for all devices)
            verifies SHA-256(OTA_public[i]) == SR1 OTP fingerprint
            checks revocation bitmap
            ECDH: S = X25519(OTA_private[i], E)
-           K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC")
+           K_s = HKDF-SHA-256(S, "SBOP-OTA-v1")
            S and K_s are zeroized after decrypt
 
 KD = permanent device key (unique per device)
@@ -1764,7 +1786,7 @@ First boot after OTA (K_s-encrypted via X25519 ECDH, FLAG_OTA_PENDING set):
 │ 0x000070  16 B    IV_ota (random)                 YES       │
 │ 0x000080  ≤512 KB AES-256-CTR(K_s, IV_ota,        NO        │
 │                   Payload)                        (ciphertext)│
-│         K_s = HKDF-SHA-256(X25519(OTA_private[enc_key_index], E), "SBOP-OTA-ENC") │
+│         K_s = HKDF-SHA-256(X25519(OTA_private[enc_key_index], E), "SBOP-OTA-v1") │
 │ 0x080080  116 B   InnerSignatureBlock             YES       │
 │                   (outside encryption envelope)    (public   │
 │                                                    signature)│
@@ -2595,8 +2617,9 @@ EOL test (Python + pyOCD, after Pass 3 provisioning):
 ```
 // Phase 11 (EXECUTE), before jumping:
 *(volatile uint32_t *)0x2400_0000 = 0x424F4F54;  // "BOOT"
-// ... copy image, set VTOR, clear state ...
-// Jump to application
+// ... copy image, invalidate I-Cache, set VTOR, clear state ...
+// Jump to application via BX (branch), NOT BLX (call).
+// A call would push LR onto the application stack.
 ```
 
 **Application semaphore:**
@@ -2948,7 +2971,7 @@ function sbop_boot_pass1() -> Never:
         else:
             // AXI SRAM intact — safe to jump directly to application
             RTC->BKP0R = 0  // Clear magic for next cold boot
-            jump_to_application()  // Never returns
+            jump_to_application()  // Never returns (branch, not call — §3.1.1)
             // Total Pass 2: ~5 ms
 
     // Normal path — full boot with IWDG
@@ -3086,14 +3109,14 @@ Y-Modem:          IWDG_REFRESH()              // Before each frame + before sect
 | LOCK_BOOT | BP bit set via SPI | < 1 ms | Yes (after) |
 | EXECUTE | Set RTC magic + NVIC_SystemReset | < 1 ms | Reset stops IWDG |
 | **Total Pass 1** | | **~190 ms** | **800 ms timeout, 610 ms margin** |
-| **Pass 2** | Detect RTC magic, CRC-32 check AXI SRAM, jump | **~5 ms** | IWDG stopped (reset state) |
+| **Pass 2** | Detect RTC magic, I-Cache invalidate, CRC-32 check AXI SRAM, jump | **~5 ms** | IWDG stopped (reset state) |
 
 **Normal boot (KD-encrypted, no re-encrypt needed):**
 
 | Pass | Time | IWDG state |
 |---|---|---|
 | Pass 1 (full verify) | ~140 ms | Running (800 ms timeout, 660 ms margin) |
-| Pass 2 (fast jump) | ~5 ms | Stopped (hardware reset state) |
+| Pass 2 (fast jump: RTC magic detect, I-Cache inval, CRC-32 check, jump) | ~5 ms | Stopped (hardware reset state) |
 | **Total to app** | **~145 ms** | IWDG disabled |
 
 **RTC backup register usage:**
@@ -3682,7 +3705,7 @@ Phase 5 (OTA_DECRYPT + VERIFY_SIGNATURE) + Phase 6 (VERIFY_INTEGRITY) — combin
   1c. Check SR2 OTA revocation bitmap for enc_key_index
   1d. E = nor_read(slot_base + 80, 32)                             // Ephemeral public key
   1e. S = X25519(OTA_private[enc_key_index], E)                     // ECDH shared secret
-  1f. K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC", 32)                   // AES-256 session key
+  1f. K_s = HKDF-SHA-256(S, "SBOP-OTA-v1", 32)                   // AES-256 session key
   1g. secure_zeroize(S, 32)
 
   // For subsequent boots (FLAG_OTA_PENDING clear):
@@ -3728,6 +3751,7 @@ Phase 11 (EXECUTE) — plaintext already in AXI SRAM:
   4. RTC->BKP0R = IWDG_RESET_MAGIC             // Two-pass handshake
   5. NVIC_SystemReset()                         // IWDG stops → Pass 2 → jump_to_prepared_application()
   // Pass 2 handles VTOR, MSP, PC setup and workspace zeroization
+  // Jump to app uses BX (branch), not BLX (call) — see Boot_Flow_Pseudocode §2
 ```
 
 **Why this is safe against power-off attack:**
@@ -4031,7 +4055,7 @@ OTA is implemented as a **service library** (`libsbop-ota`) linked into the appl
 |---|---|---|
 | REQ-SR-BOOT-001 | Ed25519 (fiat-curve25519 + tinycrypt-sha512) — formally verified, constant-time. NXP CSM-style multi-key (4 key pairs): public keys embedded in image SignatureBlock, verified against SR1 OTP fingerprints at boot. Key revocation via OTP bitmap. Single-key legacy fallback (key_index=0xFF) uses PC-ROP .rodata key. | **Pass** |
 | REQ-SR-BOOT-002 | SHA-256 via STM32 HASH hardware. HMAC-SHA-256 for KD commitment, NOR-MCU binding. | **Pass** |
-| REQ-SR-BOOT-003 | AES-256-CTR via STM32 CRYP hardware for image decryption. X25519 ECDH with OTA_private[i] + ephemeral E → K_s = HKDF-SHA-256(S, "SBOP-OTA-ENC") for first boot. KD direct decrypt for subsequent boots. | **Pass** |
+| REQ-SR-BOOT-003 | AES-256-CTR via STM32 CRYP hardware for image decryption. X25519 ECDH with OTA_private[i] + ephemeral E → K_s = HKDF-SHA-256(S, "SBOP-OTA-v1") for first boot. KD direct decrypt for subsequent boots. | **Pass** |
 | TRNG health tests | STM32 RNG with built-in entropy source validation. Bootloader runs additional FIPS 140-2 continuous test at INIT phase. | **Pass** |
 
 ### 5.5 Physical Security
@@ -4062,6 +4086,7 @@ OTA is implemented as a **service library** (`libsbop-ota`) linked into the appl
 | G5 | **NOR flash Security Registers vendor-dependent size.** BY25Q32ES: 3× 1024 bytes. Winbond W25Q32JV: 3× 256 bytes. | Low | Design caps SR usage at 256 bytes per register (~96 bytes currently used). Cross-vendor compatible. Once OTP-locked, no further writes. | Acceptable |
 | G6 | **Standard SPI at 80 MHz (operational).** NOR flash supports 120 MHz max; configured at 80 MHz (SPI1 PCLK 160 MHz ÷ 2) for timing margin. Quad SPI would give 4× bandwidth but adds pin count. | Low | 80 MHz SPI ≈ 10 MB/s. 512 KB image reads in ~51 ms. Full boot (read + verify + copy) < 300 ms achievable. | Acceptable |
 | G7 | **No authenticated debug hardware.** KD_Debug challenge-response is software-only, no hardware lockout enforcement. | Low | ROP Level 2 for permanent debug disable (irreversible fuse). For SL3+: external secure element can gate debug access. | SL2 acceptable |
+| G8 | **BOOT0 pin — system bootloader bypass.** If BOOT0 pin is high at reset, STM32H750 boots into system memory (ROM) bootloader. The ROM bootloader can read internal flash via its protocol (USART/I2C/SPI/CAN), bypassing PC-ROP since the ROM code runs from system memory. ROP Level 1 does not block this path. | Medium | **Hardwire BOOT0 to GND on PCB** — prevents any entry into system bootloader. Combined with ROP Level 1, this closes the bypass. For SL3+: ROP Level 2 disables system bootloader in silicon (irreversible), or active tamper on BOOT0 pin. | SL2 acceptable (BOOT0=GND + ROP L1) |
 
 ---
 

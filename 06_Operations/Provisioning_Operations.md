@@ -1,9 +1,9 @@
 # Provisioning Operations
 
 **Document ID:** OPS-PROV-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -56,8 +56,8 @@ Step 5: Station verifies provisioning firmware signature
 Step 6:  Device powers on, enters PROVISIONING state
 Step 7:  Device samples TRNG → UID (128-bit, verified entropy per NIST SP 800-90B)
 Step 8:  Station derives KD = HKDF(KR, UID) using HSM-backed KR handle
-Step 9:  Station derives KD_Debug = HKDF(KD, "DEBUG")
-Step 10: Station derives KD_Auth = HKDF(KD, "AUTH")
+Step 9:  Station derives KD_Debug = HKDF(KD, "SBOP-DEBUG-v1")
+Step 10: Station derives KD_Auth = HKDF(KD, "SBOP-AUTH-v1")
 Step 11: Station injects KD, KD_Debug, KD_Auth into device secure element
 Step 12: Device confirms key injection (challenge-response verification)
 ```

@@ -1,9 +1,9 @@
 # Secure Debug Architecture
 
 **Document ID:** SEC-DBG-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -136,7 +136,7 @@ Device                                    Debug Host
 
 ```
 KD_Debug = HKDF-Extract(
-    salt = "SBOP_DEBUG_AUTH_v1",
+    salt = "SBOP-DEBUG-v1",
     ikm = KD  // Device Key
 )
 
