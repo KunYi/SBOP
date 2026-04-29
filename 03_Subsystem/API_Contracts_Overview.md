@@ -1,9 +1,9 @@
 # SBOP API Contracts Overview
 
 **Document ID:** SUB-API-OV-001
-**Version:** 1.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -34,7 +34,7 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 | # | API | Signature | Category | Max Time | Ref |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `boot_verify_image` | `(SlotID) → Result<ImageInfo, BootError>` | F, S | 300 ms (total boot) | §3.1 |
+| 1 | `boot_verify_image` | `(SlotID) → Result<ImageInfo, BootError>` | F, S | 300 ms (normal), 400 ms (OTA first boot) | §3.1 |
 | 2 | `boot_get_image_info` | `(SlotID) → Result<ImageInfo, BootError>` | F | < 1 ms | §3.2 |
 | 3 | `boot_set_pending_image` | `(SlotID) → Result<(), BootError>` | F | < 10 ms | §3.3 |
 | 4 | `boot_enter_failsafe` | `(BootError) → Never` | S | < 1 ms to enter | §3.4 |
@@ -159,8 +159,9 @@ This document provides a consolidated summary of all SBOP subsystem API contract
 
 | Operation | Budget | Constant-Time | Measurement |
 | --- | --- | --- | --- |
-| Full boot (INIT → EXECUTE) | < 300 ms | — | End-to-end timing |
-| Ed25519 verify | < 20 ms | Yes | TIM-001 |
+| Full boot (INIT → EXECUTE, normal) | < 300 ms | — | End-to-end timing |
+| Full boot (OTA first boot) | < 400 ms | — | Includes ECDH + GCM decrypt + re-encrypt |
+| Ed25519 verify | < 50 ms | Yes | TIM-001 |
 | X25519 ECDH | < 50 ms | Yes | TIM-002 |
 | AES-256-GCM decrypt (1 MB) | < 100 ms | Yes (GHASH) | TIM-002 |
 | SHA-256 (1 MB) | < 100 ms | Yes (fixed len) | TIM-002 |
@@ -196,7 +197,7 @@ KeyRef → { key_type, key_usage, key_id, ... }
 | --- | --- | --- | --- |
 | KI (public) | IMAGE_VERIFY | KEY_USAGE_VERIFY | Boot (Zone 1) |
 | KD | DEVICE | KEY_USAGE_DERIVE | Crypto engine only |
-| KD_OTA | DEVICE | KEY_USAGE_ENCRYPT + KEY_USAGE_DECRYPT | OTA library (SVC) |
+| KO (private) | OTA_ENCRYPT | KEY_USAGE_DERIVE | OTA library (SVC) |
 | KD_Auth | DEVICE | KEY_USAGE_SIGN | Identity (SVC) |
 | KD_Debug | DEVICE | KEY_USAGE_SIGN | Debug auth (SVC) |
 

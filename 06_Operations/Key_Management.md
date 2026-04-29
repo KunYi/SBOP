@@ -31,9 +31,10 @@ Root Key (KR) ──── HKDF ──→ Device Key (KD)
 | --- | --- | --- | --- | --- | --- |
 | KR | Symmetric (256-bit) | HSM TRNG | HSM (FIPS 140-2 L3) | Permanent | Emergency only |
 | KD | Symmetric (256-bit) | HKDF(KR, UID) | Secure element / TEE | Device lifetime | Per-device via KR rotation |
-| KD_Auth | Symmetric (256-bit) | HKDF(KD, "AUTH") | Secure element | Session-derived | Per session |
-| KD_Debug | Symmetric (256-bit) | HKDF(KD, "DEBUG") | Secure element | Device lifetime | Per-device via KR rotation |
-| KD_Storage | Symmetric (256-bit) | HKDF(KD, "STORAGE") | Secure element | Device lifetime | Per-device via KR rotation |
+| KD_Auth | Symmetric (256-bit) | HKDF(KD, "SBOP-AUTH-v1") | Secure element | Session-derived | Per session |
+| KD_Debug | Symmetric (256-bit) | HKDF(KD, "SBOP-DEBUG-v1") | Secure element | Device lifetime | Per-device via KR rotation |
+| KD_Storage | Symmetric (256-bit) | HKDF(KD, "SBOP-STORAGE-v1") | Secure element | Device lifetime | Per-device via KR rotation |
+| KO (X25519) | Asymmetric key pair | HSM TRNG (ceremony) | HSM (private), Bootloader OTP (public) | Permanent (global) | Emergency only |
 | KI (Ed25519) | Asymmetric key pair | HSM TRNG | HSM | Per firmware version | Per release |
 
 ---
@@ -44,7 +45,7 @@ Root Key (KR) ──── HKDF ──→ Device Key (KD)
 
 | Location | Protection | Access Control |
 | --- | --- | --- |
-| HSM (KR, KI) | FIPS 140-2 Level 3+ | Multi-party quorum (N-of-M) |
+| HSM (KR, KO, KI) | FIPS 140-2 Level 3+ | Multi-party quorum (N-of-M) |
 | Secure element (KD, sub-keys) | Hardware isolation | Key API only (no raw export) |
 | TEE (KD, sub-keys) | TrustZone / PMP isolation | Key handle only (no raw export) |
 

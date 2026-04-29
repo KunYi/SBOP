@@ -71,11 +71,16 @@ function factory_provision(provisioning_data: ProvisioningConfig) -> Result<(), 
     state = PROV_PROVISIONING
     
     // ── Phase 2: Generate Device Identity ──
+    // generate_device_uid(): Platform-specific TRNG read. Not an SBOP public API —
+    // each platform implements this via its own TRNG/HASH peripheral driver.
     let device_uid = generate_device_uid()
     // UUIDv4 format: 128-bit random from TRNG
     assert(device_uid.entropy_ok(), ERR-CRYPTO-RNG-001)
     
     // Generate attestation key pair
+    // crypto_generate_keypair(): Platform-specific key generation. Not an SBOP
+    // public API — the platform secure element or crypto peripheral generates the
+    // Ed25519 keypair internally. The private key never leaves the secure element.
     let attestation_keypair = crypto_generate_keypair(Ed25519)
     assert(attestation_keypair.is_ok(), ERR-CRYPTO-RNG-001)
     
@@ -87,6 +92,9 @@ function factory_provision(provisioning_data: ProvisioningConfig) -> Result<(), 
     assert(kd.is_valid(), ERR-ID-PROV-002)
     
     // Store KD in secure element (never exposed again)
+    // key_store_secure(): Platform-specific secure element injection. Not an SBOP
+    // public API — the platform SE/TEE driver writes the key into a hardware-
+    // isolated key slot. The key is never readable as raw bytes after this call.
     key_store_secure(KEY_SLOT_DEVICE, kd)
     
     // ── Phase 4: Derive Sub-Keys from KD ──
@@ -104,6 +112,7 @@ function factory_provision(provisioning_data: ProvisioningConfig) -> Result<(), 
     )
     assert(kd_auth.is_ok() && kd_debug.is_ok(), ERR-CRYPTO-KDF-001)
     
+    // key_store_secure(): Platform-specific — see note in Phase 3.
     key_store_secure(KEY_SLOT_AUTH, kd_auth.unwrap())
     key_store_secure(KEY_SLOT_DEBUG, kd_debug.unwrap())
     
@@ -114,6 +123,9 @@ function factory_provision(provisioning_data: ProvisioningConfig) -> Result<(), 
         provisioning_data.timestamp
     ])
     
+    // crypto_sign(): Platform-specific SE signing operation. Not an SBOP public
+    // API — the private key is held in the secure element and never exposed.
+    // The SE signs attestation_data internally and returns the Ed25519 signature.
     let attestation_proof = crypto_sign(
         data = attestation_data,
         key = attestation_keypair.private_key

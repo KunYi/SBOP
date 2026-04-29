@@ -106,15 +106,15 @@ A slot is "valid" when: signature OK, integrity OK, version >= OTP counter.
 
 | Interface | Function | Direction | Error Codes |
 |-----------|----------|-----------|-------------|
-| Crypto | `verify_signature(image, sig, pubkey)` | Call | ERR-BOOT-SIG-001 |
-| Crypto | `compute_hash(image)` | Call | ERR-BOOT-HASH-001 |
+| Crypto | `verify_signature(image, sig, pubkey)` | Call | ERR-BOOT-CRYPTO-001 |
+| Crypto | `compute_hash(image)` | Call | ERR-BOOT-CRYPTO-002 |
 | Crypto | `constant_time_compare(a, b)` | Call | — |
-| Identity | `get_device_identity()` | Call | ERR-BOOT-ID-001 |
-| Identity | `get_ki_public_key()` | Call | ERR-BOOT-KEY-001 |
-| Platform | `otp_read(addr)` | Call | ERR-BOOT-OTP-001 |
-| Platform | `otp_write(addr, val)` | Call | ERR-BOOT-OTP-002 |
-| Update | `get_slot_info(slot)` | Call | ERR-BOOT-SLOT-001 |
-| Update | `mark_active(slot)` | Call | ERR-BOOT-SLOT-002 |
+| Identity | `get_device_identity()` | Call | ERR-ID-PROV-001 |
+| Identity | `get_ki_public_key()` | Call | ERR-BOOT-CRYPTO-004 |
+| Platform | `otp_read(addr)` | Call | ERR-STOR-READ-001 |
+| Platform | `otp_write(addr, val)` | Call | ERR-STOR-WRITE-001 |
+| Update | `get_slot_info(slot)` | Call | ERR-STOR-READ-001 |
+| Update | `mark_active(slot)` | Call | ERR-STOR-WRITE-001 |
 
 ---
 

@@ -126,7 +126,7 @@ Where `KO_public` is the device's long-term X25519 public key, burned in bootloa
 **Key points:**
 - Ephemeral key pair generated per OTA release (forward secrecy per release)
 - Same KO_public for all devices (operational simplicity — single OTA image)
-- Static device key pair (KO) is per-device unique for secondary encryption binding
+- Static key pair (KO) is identical across all devices (operational simplicity). Secondary encryption binding uses KD_Storage (per-device unique via HKDF from KD).
 - The ephemeral public key is included in the OTA image header for device-side ECDH
 
 **Constant-time requirement:** X25519 scalar multiplication MUST be implemented with fixed-window or Montgomery ladder — no data-dependent branches or array indices based on secret key material.

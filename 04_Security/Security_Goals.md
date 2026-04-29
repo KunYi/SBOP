@@ -167,7 +167,7 @@ Only authorized devices shall be provisioned, and all provisioning shall be audi
 | G-INT | REQ-SR-BOOT-002 | Image_Format, Crypto_Algorithms | TEST-BOOT-003 |
 | G-AVAIL | REQ-FR-OTA-004/005 | OTA_Recovery, System_Flow | TEST-OTA-002/004 |
 | G-CLONE | REQ-SR-ID-001/002 | Identity_Overview, Anti_Cloning | TEST-ID-002 |
-| G-CONF | REQ-SR-CONF-001/002 | Crypto_Overview, Key_Hierarchy | ANALYSIS |
+| G-CONF | REQ-SR-CONF-001 | Crypto_Overview, Key_Hierarchy | ANALYSIS |
 | G-SC | REQ-SR-SC-001/002 | Supply_Chain_Security | SC-AUDIT-001/002 |
 | G-PHY | REQ-SR-PHY-001/002 | Physical_Tamper_Resistance | FI-001 |
 | G-SCH | REQ-SR-SCH-001 | Side_Channel_Countermeasures | TIM-001/002, TVLA |

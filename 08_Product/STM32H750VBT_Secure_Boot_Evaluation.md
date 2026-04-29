@@ -1,9 +1,9 @@
 # STM32H750VBT Secure Boot Platform Evaluation
 
 **Document ID:** PRD-EVAL-001
-**Version:** 1.0
+**Version:** 2.0
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 **Owner:** Platform Evaluation Team
 
 ---
@@ -158,8 +158,8 @@ The SBOP bootloader on this platform operates as a **strictly single-threaded, r
 
 ```
 RESET → INIT → SELECT_SLOT → LOAD_IMAGE → PARSE_HEADER →
-VERIFY_SIGNATURE → VERIFY_INTEGRITY → CHECK_VERSION →
-COMMIT_VERSION → MARK_ACTIVE → LOCK_BOOT → EXECUTE (jump to app)
+[OTA_DECRYPT if FLAG_OTA_PENDING] → VERIFY_SIGNATURE → VERIFY_INTEGRITY →
+CHECK_VERSION → COMMIT_VERSION → MARK_TESTING → LOCK_BOOT → EXECUTE (jump to app)
 ```
 
 Once the `EXECUTE` phase transfers control to the application firmware in Zone 2, the bootloader is **terminated** — it does not co-reside with the application. The application runs in a separate address space (external NOR flash) and has its own stack, vector table, and runtime.
@@ -271,7 +271,7 @@ OTA_KEY_PAIR[0..3]:
   SHA-256(OTA_public[i]) in SR1 OTP[192..319]              ← Fingerprint (verification)
   OTA revocation bitmap in SR1 OTP (one-way clear)          ← Revocation
 
-KD_Auth         = HKDF-SHA-256(KD, "SBOP-OTA-AUTH")        ← OTA authentication key (32 B)
+KD_Auth         = HKDF-SHA-256(KD, "SBOP-AUTH-v1")          ← OTA authentication key (32 B)
 ```
 
 OTA_KEY_PAIR are **not per-device** — all devices share the same four key pairs. Per-device uniqueness is provided by the bootloader's KD re-encrypt on first boot (Stage 2). Extracting `OTA_private[i]` from a device enables decryption only; the Ed25519 firmware signature and backend-held `OTA_public[i]` prevent an attacker from creating and delivering malicious encrypted firmware.
@@ -710,9 +710,10 @@ The bootloader has one job at power-on: verify the selected slot's image is auth
 │ Zone 1: Bootloader (internal flash, 128 KB)         │
 │                                                     │
 │  INIT → SELECT_SLOT → LOAD_IMAGE → PARSE_HEADER    │
+│  → [OTA_DECRYPT if FLAG_OTA_PENDING]                │
 │  → VERIFY_SIGNATURE → VERIFY_INTEGRITY              │
-│  → CHECK_VERSION → COMMIT_VERSION → MARK_ACTIVE     │
-│  → LOCK_BOOT → COPY_TO_AXI → EXECUTE                │
+│  → CHECK_VERSION → COMMIT_VERSION → MARK_TESTING    │
+│  → LOCK_BOOT → EXECUTE                              │
 │                                                     │
 │  Bootloader never:                                  │
 │    - Connects to network                            │
@@ -1067,7 +1068,8 @@ Y-Modem in the bootloader is a safety net, not a manufacturing path. If both slo
 function ymodem_receive_firmware() -> Result<(), BootError>:
     // Wait for Y-Modem start (0x43 'C' poll, 60s timeout)
     if !ymodem_wait_start(60_000_ms):
-        return Err(ERR-RECOV-TIMEOUT)
+        // ERR-SRP-FRAME-001: No valid Y-Modem start frame received within timeout
+        return Err(ERR-SRP-FRAME-001)
 
     // Receive file header (filename, size)
     let header = ymodem_receive_frame(0)?
@@ -1396,12 +1398,10 @@ function sbop_boot():
     // ImageHeader is plaintext in NOR — parse it directly
     header = parse_header(image_data[0..80])
 
-    // Verify HMAC over header fields (SPI bus integrity)
-    let hmac_input = image_data[0..56]  // All fields before header_hmac
-    let expected_hmac = hmac_sha256(kd, hmac_input)[0..16]  // Truncated to 128 bits
-    assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-PARSE-010)
-    // FIH: redundant HMAC verify
-    assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-STATE-003)
+    // Header HMAC skipped here — on OTA first boot, header_hmac is a placeholder
+    // set by the Dev Team packaging tool (which does not know per-device KD).
+    // HMAC is verified below only for normal KD-encrypted boots, where the
+    // bootloader itself wrote the HMAC during the previous re-encrypt step.
 
     // encrypted_rest = E (32 B) || IV (16 B) || AES-CTR(Payload) || InnerSignatureBlock (116 B)
     encrypted_rest = image_data[80..]
@@ -1438,6 +1438,13 @@ function sbop_boot():
         secure_zeroize(K_s, 32)                                 // Session key no longer needed
     else:
         // ── Normal boot: KD decrypt ──
+        // Verify header HMAC — valid because bootloader wrote it during prior re-encrypt
+        let hmac_input = image_data[0..56]
+        let expected_hmac = hmac_sha256(kd, hmac_input)[0..16]
+        assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-PARSE-010)
+        // FIH: redundant HMAC verify
+        assert(constant_time_compare(image_data[56..72], expected_hmac, 16), ERR-BOOT-STATE-003)
+
         plaintext_with_sig = aes_ctr_decrypt(kd, iv, ciphertext_with_sig)
 
     // plaintext_with_sig = Payload || InnerSignatureBlock
@@ -1532,7 +1539,7 @@ function sbop_boot():
 
         // Staging area will be erased on next OTA write to this slot (or lazily)
 
-    // ... Phases 7-10: CHECK_VERSION, COMMIT_VERSION, MARK_ACTIVE, LOCK_BOOT ...
+    // ... Phases 7-10: CHECK_VERSION, COMMIT_VERSION, MARK_TESTING, LOCK_BOOT ...
 
     // ── Phase 11: Execute (payload already in AXI SRAM) ──
     state = EXECUTE
@@ -2454,7 +2461,8 @@ function ota_check_for_update(backend_url, current_version, result):
     update_info = backend_request_update(device_id, current_version, auth_token)
 
     if update_info.firmware_version < current_version:
-        return ERR-OTA-VERSION-001  // Backend offered a downgrade — reject
+        // ERR-OTA-AUTH-003: Backend offered version < current — downgrade rejected
+        return ERR-OTA-AUTH-003
 
     // Backend signature covers version — verified separately in Gate 1
     result = update_info
@@ -2819,9 +2827,9 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
     state = COMMIT_VERSION
     // ... version counter increment ...
 
-    // ── Phase 9: Mark Slot Active ──
-    state = MARK_ACTIVE
-    storage_set_slot_status(slot, ACTIVE)
+    // ── Phase 9: Mark Slot Testing ──
+    state = MARK_TESTING
+    storage_set_slot_status(slot, TESTING)
 
     // ── Phase 10: Lock Boot ──
     state = LOCK_BOOT
@@ -3048,7 +3056,7 @@ VERIFY_INTEGRITY: IWDG refresh               // After SHA-256 finalize
     after copy:          IWDG refresh        // Each 4 KB page write ~0.4 ms
 CHECK_VERSION:   IWDG refresh                // After SR1 reads
 COMMIT_VERSION:  IWDG refresh                // After SR1 write
-MARK_ACTIVE:     IWDG refresh                // After metadata write
+MARK_TESTING:     IWDG refresh                // After metadata write
 LOCK_BOOT:       IWDG refresh                // After BP bit set
 EXECUTE:         CRC-32 over AXI SRAM first 4 KB → RTC->BKP1R
                  Write RTC->BKP0R = 0x49574447
@@ -3065,15 +3073,16 @@ Y-Modem:          IWDG_REFRESH()              // Before each frame + before sect
 | SELECT_SLOT | Metadata read | < 1 ms | Yes (after) |
 | LOAD_IMAGE | NOR read (80 B header + 16 B IV) | < 1 ms | Yes (after) |
 | PARSE_HEADER | Header validation | < 1 ms | Yes (after) |
-| VERIFY_SIGNATURE | AES-CTR decrypt 512 KB to AXI SRAM | ~51 ms | Every 4 KB (~0.4 ms each) |
-| VERIFY_SIGNATURE | Ed25519 verify | ~1.2 ms | Yes (after decrypt, before verify) |
+| OTA_DECRYPT | ECDH + HKDF derive K_s | ~16 ms | Yes (after key derivation) |
+| OTA_DECRYPT | AES-CTR decrypt 512 KB to AXI SRAM | ~51 ms | Every 4 KB (~0.4 ms each) |
+| OTA_DECRYPT | KD_Storage re-encrypt: write staging area | ~0.4 ms | Yes (after) |
+| OTA_DECRYPT | KD_Storage re-encrypt: sector erase | ~45 ms | Yes (before) |
+| OTA_DECRYPT | KD_Storage re-encrypt: copy staging → slot base | ~51 ms | Every 4 KB (~0.4 ms each) |
+| VERIFY_SIGNATURE | Ed25519 verify | ~1.2 ms | Yes (after) |
 | VERIFY_INTEGRITY | SHA-256 (HW HASH, streaming) | ~13 ms | Yes (after finalize) |
-| Phase 6b | NOR write staging area (header + IV + encrypted) | ~0.4 ms | Yes (after) |
-| Phase 6b | NOR sector erase (original area) | ~45 ms | Yes (before) |
-| Phase 6b | NOR copy staging → slot base (512 KB) | ~51 ms | Every 4 KB (~0.4 ms each) |
 | CHECK_VERSION | SR1 reads (4-way redundant) | < 1 ms | Yes (after) |
 | COMMIT_VERSION | SR1 write | ~10 ms | Yes (after) |
-| MARK_ACTIVE | Metadata write | ~10 ms | Yes (after) |
+| MARK_TESTING | Metadata write | ~10 ms | Yes (after) |
 | LOCK_BOOT | BP bit set via SPI | < 1 ms | Yes (after) |
 | EXECUTE | Set RTC magic + NVIC_SystemReset | < 1 ms | Reset stops IWDG |
 | **Total Pass 1** | | **~190 ms** | **800 ms timeout, 610 ms margin** |
@@ -3659,10 +3668,10 @@ Application runtime (if config update needed):
 
 **Boot decrypt + copy flow (Phase 5–11):**
 
-Decryption happens in a single streaming pass during Phase 5 (VERIFY_SIGNATURE). The plaintext Payload goes directly to AXI SRAM (volatile). It never touches NOR flash. Power loss at any point leaves only ciphertext in NOR.
+Decryption happens in a single streaming pass during Phase 5 (OTA_DECRYPT + VERIFY_SIGNATURE combined in this implementation). The plaintext Payload goes directly to AXI SRAM (volatile). It never touches NOR flash. Power loss at any point leaves only ciphertext in NOR.
 
 ```
-Phase 5 (VERIFY_SIGNATURE) + Phase 6 (VERIFY_INTEGRITY) — combined streaming pass:
+Phase 5 (OTA_DECRYPT + VERIFY_SIGNATURE) + Phase 6 (VERIFY_INTEGRITY) — combined streaming pass:
 
   Input:  NOR slot → ImageHeader (80 B) + E (32 B) + IV (16 B) + AES-CTR(Payload) + InnerSigBlock
   Output: AXI SRAM → Payload (plaintext, ready to execute)

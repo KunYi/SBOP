@@ -304,13 +304,18 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
         let decrypted_payload = plaintext[decrypted_header.header_size ..
                                            decrypted_header.header_size + decrypted_header.image_size]
 
-        // Re-verify header HMAC over decrypted header
-        let decrypted_hmac_input = plaintext[0..56]
-        let decrypted_expected_hmac = crypto_hmac_sha256(KD, decrypted_hmac_input)[0..16]
-        if constant_time_compare(decrypted_header.header_hmac, decrypted_expected_hmac, 16) != true:
-            return Err(ERR-BOOT-PARSE-010)
+        // Skip header HMAC check on OTA plaintext:
+        //   The header_hmac in the OTA package ImageHeader is a placeholder
+        //   set by the Dev Team packaging tool (which does not know KD).
+        //   Integrity is already covered: GCM tag authenticates ciphertext,
+        //   Ed25519 signature authenticates plaintext origin.
+        //   The real HMAC is recomputed with KD in Step 7 after re-encrypt.
 
         // FIH: Verify the OTA Ed25519 signature on plaintext (header || firmware)
+        //   The double verification below is an intentional FIH countermeasure,
+        //   not a copy-paste error. A single fault injection could flip the
+        //   result register after a single verify; two independent verifications
+        //   both checked make that attack surface much narrower.
         let ota_sig_data = plaintext[0 .. decrypted_header.header_size + decrypted_header.image_size]
         let ota_sig_valid = ed25519_verify(ota_sig_data, ota_signature, LEGACY_KI_PUBLIC)
         if ota_sig_valid != true: return Err(ERR-BOOT-CRYPTO-001)
@@ -469,9 +474,13 @@ function boot_verify_and_execute_slot(slot: SlotID) -> Result<Never, BootError>:
             ciphertext = payload[0 .. payload.len - 16],
             tag = payload[payload.len - 16 .. payload.len]
         )
-        if decrypted_check.is_err(): return Err(ERR-BOOT-CRYPTO-008)
+        if decrypted_check.is_err():
+            secure_zeroize(kd_storage)
+            return Err(ERR-BOOT-CRYPTO-008)
         let computed_hash = crypto_compute_hash(decrypted_check.unwrap())
         if constant_time_compare(computed_hash, header.hash, 32) != true:
+            secure_zeroize(kd_storage)
+            secure_zeroize(decrypted_check)
             return Err(ERR-BOOT-CRYPTO-002)
         secure_zeroize(kd_storage)
         secure_zeroize(decrypted_check)

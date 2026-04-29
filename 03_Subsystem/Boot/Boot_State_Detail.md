@@ -1,9 +1,9 @@
 # Boot State Machine - Detailed Specification
 
 **Document ID:** SUB-BOOT-ST-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -63,7 +63,24 @@ Failure: → FAILSAFE (or try other slot if not yet attempted)
 - Validate reserved field is zero
 - Extract signature algorithm from header flags
 
-Success: → VERIFY_SIGNATURE
+If FLAG_OTA_PENDING: → OTA_DECRYPT
+Otherwise: → VERIFY_SIGNATURE
+Failure: → FAILSAFE
+
+---
+
+### OTA_DECRYPT
+
+- Parse OTAImagePackage header (OTAHeader 44 B)
+- X25519 ECDH key agreement: KO_private (secure element) × ephemeral public key (from OTA header)
+- HKDF derive K_s ("SBOP-OTA-v1" || FirmwareVersion) and GCM nonce ("SBOP-OTA-NONCE-v1")
+- AES-256-GCM decrypt payload with K_s, nonce, AAD
+- Verify Ed25519 signature on decrypted plaintext (FIH redundant verify)
+- Re-encrypt plaintext with KD_Storage (AES-256-GCM, device-unique)
+- Write re-encrypted image to slot, clear FLAG_OTA_PENDING
+- Zeroize K_s, SharedSecret, plaintext, KO_private
+
+Success: → VERIFY_SIGNATURE (ota_verified = true)
 Failure: → FAILSAFE
 
 ---
@@ -96,29 +113,30 @@ Failure: → FAILSAFE
 - Version must be >= OTP counter value
 - Redundant comparison (two independent reads of OTP) for glitch resistance
 
-Success: → COMMIT_VERSION (if version > OTP) or → MARK_ACTIVE (if version == OTP)
+Success: → COMMIT_VERSION (if version > stored) or → MARK_TESTING (if version == stored)
 Failure: → FAILSAFE
 
 ---
 
 ### COMMIT_VERSION
 
-- Burn OTP counter to new version (only if `image_version > otp_version`)
-- OTP write must complete atomically
-- Verify OTP write succeeded by reading back
+- Write stored version counter to new version (only if `image_version > stored_version`)
+- Write must complete atomically (critical journal two-copy protocol)
+- Verify write succeeded by reading back
 - Retry once on failure; then → FAILSAFE
 
-Success: → MARK_ACTIVE
+Success: → MARK_TESTING
 Failure: → FAILSAFE
 
 ---
 
-### MARK_ACTIVE
+### MARK_TESTING
 
-- Set selected slot state to ACTIVE
-- Set other slot state to INACTIVE (if it was ACTIVE)
-- Write slot metadata atomically
-- Lock Zone 1 memory regions: code read-only, data read-write restricted
+- Set selected slot state to TESTING (test/confirm model)
+- Set other slot state to FALLBACK (if it was ACTIVE)
+- Write slot metadata atomically (critical journal)
+- Application must call boot_set_confirmed() to promote to ACTIVE
+- If device resets before confirmation → immediate rollback
 
 Success: → LOCK_BOOT
 Failure: → FAILSAFE
@@ -173,17 +191,18 @@ No transitions from EXECUTE (boot is complete).
 | Phase | Maximum Time | Notes |
 |-------|-------------|-------|
 | RESET → INIT | Hardware-dependent | Includes power ramp, clock stabilization |
-| INIT → SELECT_SLOT | 10 ms | Crypto engine init, TRNG health test |
-| SELECT_SLOT | 5 ms | Metadata reads from flash |
-| LOAD_IMAGE | 50 ms | Flash read, bounded by image header size |
-| PARSE_HEADER | 2 ms | Fixed-size struct parsing |
-| VERIFY_SIGNATURE | 100 ms | Ed25519 |
-| VERIFY_INTEGRITY | 200 ms | SHA-256 over full image (size-dependent) |
-| CHECK_VERSION | 2 ms | OTP read |
-| COMMIT_VERSION | 10 ms | OTP write (if needed) |
-| MARK_ACTIVE | 5 ms | Flash write slot metadata |
-| LOCK_BOOT | 2 ms | MPU register writes |
-| EXECUTE | — | Boot complete |
+| INIT → SELECT_SLOT | 6 ms | Crypto engine init, TRNG health test |
+| SELECT_SLOT | < 1 ms | Critical + frequent journal reads |
+| LOAD_IMAGE | 100 ms | Flash read, bounded by image size |
+| PARSE_HEADER | < 1 ms | Fixed-size struct parsing |
+| OTA_DECRYPT | < 200 ms | X25519 ECDH + AES-256-GCM + KD_Storage re-encrypt (OTA first boot only) |
+| VERIFY_SIGNATURE | 50 ms | Ed25519 (skipped if OTA already verified) |
+| VERIFY_INTEGRITY | 100 ms | SHA-256 over full image (size-dependent) |
+| CHECK_VERSION | < 1 ms | Version counter read |
+| COMMIT_VERSION | < 10 ms | Version counter write (if needed) |
+| MARK_TESTING | < 45 ms | Critical journal write (OTA events only) |
+| LOCK_BOOT | < 1 ms | MPU register writes |
+| EXECUTE | < 2 ms | Frequent journal append + RTC magic + system reset |
 
 ---
 

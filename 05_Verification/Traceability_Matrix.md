@@ -46,7 +46,6 @@ REQ → Design → Subsystem → Test → Evidence
 |-------------|-----------------|-----------|--------------|
 | REQ-SR-ID-001 | Identity_Overview, Provisioning_Flow | Identity | TEST-ID-001 |
 | REQ-SR-ID-002 | Anti_Cloning, Identity_Overview | Identity | TEST-ID-002 |
-| REQ-SR-ID-003 | Identity_Failure_Model | Identity | TEST-ID-003 |
 
 ## 5. Security Requirements (Supply Chain — A6)
 

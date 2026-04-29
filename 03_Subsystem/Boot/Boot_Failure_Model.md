@@ -1,9 +1,9 @@
 # Boot Failure Model
 
 **Document ID:** SUB-BOOT-FAIL-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -26,7 +26,7 @@ Defines all boot failure scenarios, their error codes, system response, and reco
 2. Attempt fallback to other slot
 3. If both slots invalid → FAILSAFE
 
-**Error Code:** `ERR-BOOT-STOR-003` (Metadata CRC mismatch)
+**Error Code:** `ERR-STOR-READ-001` (Metadata CRC mismatch — storage read failure)
 
 **Recovery:** Backend-initiated OTA to repair corrupted slot.
 
@@ -65,7 +65,7 @@ Defines all boot failure scenarios, their error codes, system response, and reco
 2. Attempt fallback to other slot
 3. If fallback also fails → FAILSAFE
 
-**Error Code:** `ERR-BOOT-CRYPTO-005` (Hash mismatch)
+**Error Code:** `ERR-BOOT-CRYPTO-002` (Hash mismatch)
 
 **Recovery:** Same as F-BOOT-002. Hash failure may indicate flash degradation (SEU/TID) or corruption.
 
@@ -122,7 +122,7 @@ Defines all boot failure scenarios, their error codes, system response, and reco
 2. If fallback also fails → FAILSAFE
 3. Log hardware fault for diagnostics
 
-**Error Code:** `ERR-BOOT-CRYPTO-003` (Crypto engine hardware fault)
+**Error Code:** `ERR-BOOT-CRYPTO-006` (Crypto engine hardware fault)
 
 **Recovery:** Persistent crypto fault may indicate hardware failure. Device requires replacement if both HW and SW crypto fail.
 

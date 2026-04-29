@@ -1,9 +1,9 @@
 # SBOP System State Machine
 
 **Document ID:** SYS-SM-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -24,11 +24,12 @@ Defines all valid system states and transitions, aligned with the 12-phase boot 
 | SELECT_SLOT | Choose highest-version valid slot (A or B) |
 | LOAD_IMAGE | Load image header from selected slot |
 | PARSE_HEADER | Parse and validate ImageHeader struct |
+| OTA_DECRYPT | ECDH + AES-256-GCM decrypt + KD_Storage re-encrypt (FLAG_OTA_PENDING only) |
 | VERIFY_SIGNATURE | Ed25519 signature check |
 | VERIFY_INTEGRITY | SHA-256 hash over image body |
-| CHECK_VERSION | Compare version against OTP counter |
-| COMMIT_VERSION | Burn OTP counter if version > current |
-| MARK_ACTIVE | Set slot ACTIVE flag |
+| CHECK_VERSION | Compare version against version counter |
+| COMMIT_VERSION | Write version counter if version > current |
+| MARK_TESTING | Set slot TESTING flag (test/confirm model) |
 | LOCK_BOOT | MPU/MMU lockdown, Zone 1 read-only |
 | EXECUTE | Jump to Zone 2 entry point |
 | FAILSAFE | Terminal state — no firmware execution |
@@ -51,6 +52,9 @@ LOAD_IMAGE ───────────────────────
 PARSE_HEADER ───────────────────────→ FAILSAFE (invalid header)
   │
   ▼
+OTA_DECRYPT ────────────────────────→ FAILSAFE (ECDH/GCM/re-encrypt failure)
+  │
+  ▼
 VERIFY_SIGNATURE ───────────────────→ FAILSAFE (invalid signature)
   │
   ▼
@@ -60,10 +64,10 @@ VERIFY_INTEGRITY ───────────────────→ FA
 CHECK_VERSION ──────────────────────→ FAILSAFE (rollback detected)
   │
   ▼
-COMMIT_VERSION ─────────────────────→ FAILSAFE (OTP write failure)
+COMMIT_VERSION ─────────────────────→ FAILSAFE (version write failure)
   │
   ▼
-MARK_ACTIVE
+MARK_TESTING ───────────────────────→ FAILSAFE (slot write failure)
   │
   ▼
 LOCK_BOOT

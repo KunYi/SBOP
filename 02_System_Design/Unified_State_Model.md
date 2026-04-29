@@ -1,9 +1,9 @@
 # Unified State Model
 
 **Document ID:** SYS-USM-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -24,11 +24,12 @@ Aligned with `State_Machine.md` and `Boot_Flow_Pseudocode.md`:
 | BOOT_SELECT_SLOT | Select highest-version valid slot (A or B) |
 | BOOT_LOAD_IMAGE | Load image header from selected slot |
 | BOOT_PARSE_HEADER | Parse and validate ImageHeader struct |
+| BOOT_OTA_DECRYPT | ECDH + AES-256-GCM decrypt + KD_Storage re-encrypt (if FLAG_OTA_PENDING) |
 | BOOT_VERIFY_SIGNATURE | Ed25519 signature verification |
 | BOOT_VERIFY_INTEGRITY | SHA-256 hash over image body, constant-time compare |
-| BOOT_CHECK_VERSION | Compare version against OTP counter |
-| BOOT_COMMIT_VERSION | Burn OTP counter (if version > current) |
-| BOOT_MARK_ACTIVE | Set slot ACTIVE, lock Zone 1 memory |
+| BOOT_CHECK_VERSION | Compare version against version counter |
+| BOOT_COMMIT_VERSION | Write version counter (if version > current) |
+| BOOT_MARK_TESTING | Set slot TESTING (test/confirm model) |
 | BOOT_LOCK_BOOT | MPU/MMU lockdown, Zone 1 read-only |
 | BOOT_EXECUTE | Jump to Zone 2 entry point |
 | BOOT_FAILSAFE | Terminal — no firmware execution |
@@ -72,6 +73,9 @@ Aligned with `State_Machine.md` and `Boot_Flow_Pseudocode.md`:
 BOOT_RESET → BOOT_INIT → BOOT_SELECT_SLOT → BOOT_LOAD_IMAGE → BOOT_PARSE_HEADER
                                                                       │
                                                                       ▼
+                                                               BOOT_OTA_DECRYPT
+                                                                      │
+                                                                      ▼
                                                                BOOT_VERIFY_SIGNATURE
                                                                       │
                                                                       ▼
@@ -84,7 +88,7 @@ BOOT_RESET → BOOT_INIT → BOOT_SELECT_SLOT → BOOT_LOAD_IMAGE → BOOT_PARSE
                                                                BOOT_COMMIT_VERSION
                                                                       │
                                                                       ▼
-                                                               BOOT_MARK_ACTIVE
+                                                               BOOT_MARK_TESTING
                                                                       │
                                                                       ▼
                                                                BOOT_LOCK_BOOT
@@ -138,7 +142,7 @@ ID_UNINITIALIZED → ID_PROVISIONING → ID_REGISTERED → ID_LOCKED
 | BOOT_EXECUTE | OTA_IDLE | Application initiates OTA |
 | BOOT_FAILSAFE | OTA_IDLE | Recovery firmware download |
 | OTA_ROLLBACK | BOOT_RESET | Reboot to previous image |
-| ID_LOCKED | BOT_RESET | Normal device operation (after provisioning) |
+| ID_LOCKED | BOOT_RESET | Normal device operation (after provisioning) |
 
 ---
 

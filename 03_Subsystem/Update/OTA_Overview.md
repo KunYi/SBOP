@@ -89,16 +89,16 @@ Defines the OTA (Over-the-Air) subsystem responsible for secure and reliable fir
 
 | Interface | Function | Direction | Error Codes |
 |-----------|----------|-----------|-------------|
-| Crypto | `verify_signature(image, sig, pubkey)` | Call | ERR-OTA-SIG-001 |
-| Crypto | `compute_hash(image)` | Call | ERR-OTA-HASH-001 |
+| Crypto | `verify_signature(image, sig, pubkey)` | Call | ERR-BOOT-CRYPTO-001 |
+| Crypto | `compute_hash(image)` | Call | ERR-BOOT-CRYPTO-002 |
 | Identity | `get_device_certificate()` | Call | ERR-OTA-AUTH-001 |
-| Identity | `get_device_uid()` | Call | ERR-OTA-ID-001 |
-| Boot | `get_slot_info(slot)` | Call | ERR-OTA-SLOT-001 |
-| Boot | `request_activation(slot)` | Call | ERR-OTA-ACT-001 |
-| Backend | `check_update(uid, version)` | mTLS | ERR-OTA-NET-001 |
-| Backend | `download_firmware(url, range)` | mTLS | ERR-OTA-NET-002 |
-| Backend | `report_status(uid, state)` | mTLS | ERR-OTA-NET-003 |
-| Storage | `write_slot(slot, offset, data)` | Call | ERR-OTA-STOR-001 |
+| Identity | `get_device_uid()` | Call | ERR-ID-PROV-001 |
+| Boot | `get_slot_info(slot)` | Call | ERR-STOR-READ-001 |
+| Boot | `request_activation(slot)` | Call | ERR-OTA-ACTIVATE-001 |
+| Backend | `check_update(uid, version)` | mTLS | ERR-OTA-AUTH-001 |
+| Backend | `download_firmware(url, range)` | mTLS | ERR-OTA-DOWNLOAD-001 |
+| Backend | `report_status(uid, state)` | mTLS | ERR-OTA-AUTH-002 |
+| Storage | `write_slot(slot, offset, data)` | Call | ERR-STOR-WRITE-001 |
 
 ---
 
@@ -134,7 +134,7 @@ Defines the OTA (Over-the-Air) subsystem responsible for secure and reliable fir
 | OTA Flow Pseudocode | `OTA_Flow_Pseudocode.md` |
 | OTA Interface | `OTA_Interface.md` |
 | OTA Failure Model | `OTA_Failure_Model.md` |
-| OTA Deployment | `../../04_Security/OTA_Deployment.md` |
+| OTA Deployment | `../../06_Operations/OTA_Deployment.md` |
 | Error Code Catalog | `../../02_System_Design/Error_Code_Catalog.md` |
 | Trust Model | `../../00_Architecture/Trust_Model.md` |
 | Architecture Decision Record | `../../00_Architecture/Architecture_Decision_Record.md` (ADR-005) |

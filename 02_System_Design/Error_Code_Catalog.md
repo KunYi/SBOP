@@ -1,9 +1,9 @@
 # SBOP Error Code Catalog
 
 **Document ID:** SYS-ERR-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 

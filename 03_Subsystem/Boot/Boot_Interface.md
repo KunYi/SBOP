@@ -1,9 +1,9 @@
 # Boot Subsystem Interface Specification
 
 **Document ID:** SUB-BOOT-IF-001
-**Version:** 2.0
+**Version:** 2.1
 **Status:** Draft
-**Last Review:** 2026-04-28
+**Last Review:** 2026-04-29
 
 ---
 
@@ -40,8 +40,8 @@ Timing contract:
 
 Errors:
   - ERR-BOOT-CRYPTO-001: Signature verification failed (cryptographic)
-  - ERR-BOOT-CRYPTO-002: Unsupported algorithm
-  - ERR-BOOT-CRYPTO-003: Crypto engine hardware fault
+  - ERR-BOOT-CRYPTO-003: Unsupported signature algorithm
+  - ERR-BOOT-CRYPTO-006: Crypto engine hardware fault
   - ERR-BOOT-CRYPTO-004: Key reference invalid or revoked
 ```
 
@@ -60,7 +60,7 @@ Postconditions:
   - Err(BootError::CryptoEngineError) → hardware fault
 
 Errors:
-  - ERR-BOOT-CRYPTO-005: Hash computation failed
+  - ERR-BOOT-CRYPTO-006: Crypto engine hardware fault
 ```
 
 ---
@@ -84,9 +84,9 @@ Postconditions:
   - Err(BootError::SlotInvalid) → slot marked INVALID
 
 Errors:
-  - ERR-BOOT-STOR-001: Slot read failed (hardware)
-  - ERR-BOOT-STOR-002: Image exceeds maximum size
-  - ERR-BOOT-STOR-003: Slot metadata CRC mismatch
+  - ERR-STOR-READ-001: Slot read failed (hardware)
+  - ERR-BOOT-PARSE-004: Image exceeds maximum size
+  - ERR-STOR-READ-001: Slot metadata CRC mismatch (→ Error_Code_Catalog.md)
 ```
 
 ### 3.2 read_slot_metadata
@@ -97,8 +97,8 @@ Function: read_slot_metadata(slot: SlotID) → Result<SlotMetadata, BootError>
 Purpose: Read slot metadata to determine slot status, version, and integrity.
 
 Errors:
-  - ERR-BOOT-STOR-004: Metadata read failed
-  - ERR-BOOT-STOR-003: Metadata CRC mismatch
+  - ERR-STOR-READ-001: Metadata read failed
+  - ERR-STOR-READ-001: Metadata CRC mismatch (→ Error_Code_Catalog.md)
 ```
 
 ### 3.3 mark_slot_active
@@ -117,7 +117,7 @@ Postconditions:
   - Operation is atomic (must survive power loss mid-write)
 
 Errors:
-  - ERR-BOOT-STOR-005: Slot status write failed
+  - ERR-STOR-WRITE-001: Slot status write failed
 ```
 
 ### 3.4 mark_slot_invalid

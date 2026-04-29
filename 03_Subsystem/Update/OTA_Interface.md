@@ -57,9 +57,9 @@ Postconditions:
   - Err(OTAError::NoUpdateAvailable) → device already at latest version
 
 Errors:
-  - ERR-OTA-UPDATE-001: No update available for this device
-  - ERR-OTA-UPDATE-002: Device blocked from updates
-  - ERR-OTA-UPDATE-003: Update metadata malformed
+  - ERR-OTA-AUTH-003: No update available for this device
+  - ERR-OTA-AUTH-003: Device blocked from updates
+  - ERR-OTA-DOWNLOAD-002: Update metadata malformed
 ```
 
 ### 2.3 download_firmware
@@ -83,8 +83,8 @@ Errors:
   - ERR-OTA-DOWNLOAD-001: Download interrupted (resumable)
   - ERR-OTA-DOWNLOAD-002: Hash mismatch after download
   - ERR-OTA-DOWNLOAD-003: Insufficient flash space
-  - ERR-OTA-DOWNLOAD-004: TLS error during download
-  - ERR-OTA-DOWNLOAD-005: Image size mismatch
+  - ERR-OTA-AUTH-001: TLS error during download
+  - ERR-BOOT-PARSE-004: Image size mismatch
 ```
 
 ---
@@ -109,8 +109,8 @@ Postconditions:
   - Operation is atomic (survives power loss)
 
 Errors:
-  - ERR-OTA-SLOT-001: Slot status transition failed
-  - ERR-OTA-SLOT-002: Slot metadata write failed
+  - ERR-OTA-INSTALL-001: Slot status transition failed
+  - ERR-STOR-WRITE-001: Slot metadata write failed
 ```
 
 ### 3.2 confirm_boot_success
@@ -169,9 +169,9 @@ Postconditions:
   - Write-verify performed: data read back and compared
 
 Errors:
-  - ERR-OTA-STOR-001: Flash write failed
-  - ERR-OTA-STOR-002: Write verification failed (readback mismatch)
-  - ERR-OTA-STOR-003: Offset out of bounds
+  - ERR-STOR-WRITE-001: Flash write failed
+  - ERR-STOR-WRITE-001: Write verification failed (readback mismatch)
+  - ERR-BOOT-PARSE-004: Offset out of bounds
 ```
 
 ### 4.2 erase_slot

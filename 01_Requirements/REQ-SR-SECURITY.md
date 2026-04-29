@@ -12,6 +12,8 @@
 Description:
 Firmware authenticity shall be enforced using cryptographic signature verification.
 
+Status: Approved
+
 Verification:
 ANALYSIS + TEST
 
@@ -21,6 +23,8 @@ ANALYSIS + TEST
 
 Description:
 Firmware integrity shall be verified using cryptographic hashing.
+
+Status: Approved
 
 Verification:
 TEST
@@ -32,6 +36,8 @@ TEST
 Description:
 Firmware updates shall be protected against replay attacks.
 
+Status: Approved
+
 Verification:
 TEST
 
@@ -41,6 +47,8 @@ TEST
 
 Description:
 The system shall enforce rollback protection.
+
+Status: Approved
 
 Verification:
 TEST
@@ -52,6 +60,8 @@ TEST
 Description:
 Each device shall have a unique cryptographic identity.
 
+Status: Approved
+
 Verification:
 ANALYSIS
 
@@ -61,6 +71,8 @@ ANALYSIS
 
 Description:
 Device identity shall not be clonable.
+
+Status: Approved
 
 Verification:
 ANALYSIS
@@ -72,6 +84,8 @@ ANALYSIS
 Description:
 Cryptographic keys shall be protected from unauthorized access.
 
+Status: Approved
+
 Verification:
 ANALYSIS
 
@@ -81,6 +95,8 @@ ANALYSIS
 
 Description:
 Keys shall be derived or stored securely.
+
+Status: Approved
 
 Verification:
 ANALYSIS
@@ -190,6 +206,8 @@ ANALYSIS
 
 Description:
 Key material (KR, KD, KD_Auth, KD_Debug, KD_Storage) shall never be exposed outside of the secure element / TEE / HSM in raw form. All key access shall use opaque KeyRef handles.
+
+Status: Approved
 
 Rationale:
 Direct key exposure enables extraction via memory dumps, debug access, or software bugs. KeyRef handles prevent raw key reads while allowing cryptographic operations.

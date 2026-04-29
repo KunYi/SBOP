@@ -160,6 +160,30 @@ boot_lock() -> Result<(), BootError>
         - Transfers control to EXECUTE phase
 ```
 
+### 3.6 boot_get_measurement_log
+
+```
+boot_get_measurement_log() -> Result<FrequentRecord[], BootError>
+
+    Input:  none
+    Output: FrequentRecord[]  |  all measurement log entries from frequent journal
+    Error:  ERR-STOR-READ-001 |  Cannot read frequent journal
+
+    Pre:
+        system_state in {EXECUTE, FAILSAFE} or application mode
+
+    Post:
+        Ok(records): all valid frequent journal records with intact CRC-16
+        Records are ordered by boot_seq (oldest first)
+        Returns empty array if journal has no valid records
+
+    Side effects:
+        none (read-only)
+
+    Timing Contract:
+        Max time: < 5 ms (reads up to 64 records × 64 B = 4 KB)
+```
+
 ---
 
 ## 4. Crypto Subsystem Contracts
@@ -202,7 +226,7 @@ crypto_verify_signature(
             - Whether signature is valid or invalid
             - Data content
             - Key value
-        Max time: 20 ms for Ed25519 verify at 400 MHz
+        Max time: 50 ms for Ed25519 verify
 
     Side effects:
         none
@@ -386,6 +410,47 @@ crypto_aead_decrypt(
     Security:
         All-or-nothing: no partial plaintext on tag failure
         Nonce reuse with same key is FATAL for GCM — IV reuse detection required
+```
+
+### 4.7 crypto_aead_encrypt
+
+```
+crypto_aead_encrypt(
+    key: &KeyMaterial,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8]
+) -> Result<(Vec<u8>, [u8; 16]), CryptoError>
+
+    Input:  key : &KeyMaterial  |  AES-256-GCM key (KD_Storage or K_s)
+            nonce : &[u8; 12]   |  96-bit GCM nonce (unique per key)
+            aad : &[u8]          |  Additional Authenticated Data
+            plaintext : &[u8]    |  data to encrypt and authenticate
+    Output: (Vec<u8>, [u8; 16])  |  (ciphertext, 128-bit GCM authentication tag)
+    Error:  ERR-CRYPTO-AEAD-002  |  Invalid key length (must be 32 bytes)
+
+    Pre:
+        key.len == 32
+        nonce.len == 12
+        plaintext.len > 0
+        (key, nonce) pair has not been used before (GCM nonce reuse is FATAL)
+
+    Post:
+        ciphertext == AES-256-GCM-Encrypt(key, nonce, aad, plaintext)
+        ciphertext.len == plaintext.len
+        tag is the 128-bit GCM authentication tag over ciphertext and AAD
+        Deterministic: same (key, nonce, aad, plaintext) → same (ciphertext, tag)
+
+    Timing Contract:
+        GHASH must be constant-time with respect to plaintext and AAD
+        CTR-mode XOR is data-independent
+
+    Side effects:
+        Output buffer contains ciphertext — caller responsible for secure storage
+
+    Security:
+        (key, nonce) MUST be unique per encryption — nonce reuse is FATAL for GCM
+        Use TRNG nonces (KD_Storage) or HKDF-derived nonces (K_s) per specification
 ```
 
 ---

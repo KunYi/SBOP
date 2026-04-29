@@ -1,7 +1,7 @@
 # SBOP Serial Recovery Protocol (SRP)
 
 **Document ID:** SUB-BOOT-SRP-001
-**Version:** 1.0
+**Version:** 2.1
 **Status:** Draft
 **Last Review:** 2026-04-29
 
